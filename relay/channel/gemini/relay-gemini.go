@@ -266,21 +266,15 @@ func CovertOpenAI2Gemini(c *gin.Context, textRequest dto.GeneralOpenAIRequest, i
 					}
 
 					// convert snake_case to camelCase for Gemini API
-					geminiImageConfig := make(map[string]interface{})
-					if aspectRatio, ok := imageConfig["aspect_ratio"]; ok {
-						geminiImageConfig["aspectRatio"] = aspectRatio
+					geminiImageConfig := &dto.GeminiImageConfig{}
+					if aspectRatio, ok := imageConfig["aspect_ratio"].(string); ok {
+						geminiImageConfig.AspectRatio = aspectRatio
 					}
-					if imageSize, ok := imageConfig["image_size"]; ok {
-						geminiImageConfig["imageSize"] = imageSize
+					if imageSize, ok := imageConfig["image_size"].(string); ok {
+						geminiImageConfig.ImageSize = imageSize
 					}
 
-					if len(geminiImageConfig) > 0 {
-						imageConfigBytes, err := common.Marshal(geminiImageConfig)
-						if err != nil {
-							return nil, fmt.Errorf("failed to marshal image_config: %w", err)
-						}
-						geminiRequest.GenerationConfig.ImageConfig = imageConfigBytes
-					}
+					geminiRequest.GenerationConfig.ImageConfig = geminiImageConfig
 				}
 			}
 		}
@@ -1263,7 +1257,6 @@ func handleImageGenerationResponse(c *gin.Context, info *relaycommon.RelayInfo, 
 	}
 
 	var responseBody []byte
-	var err error
 
 	switch info.RelayFormat {
 	case types.RelayFormatGemini:
