@@ -1199,6 +1199,85 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 	return usage, nil
 }
 
+// isImageGenerationResponse checks if the response contains image data
+func isImageGenerationResponse(response *dto.GeminiChatResponse) bool {
+	if len(response.Candidates) == 0 {
+		return false
+	}
+
+	candidate := response.Candidates[0]
+	if len(candidate.Content.Parts) == 0 {
+		return false
+	}
+
+	// Check if any part contains image data
+	for _, part := range candidate.Content.Parts {
+		if part.InlineData != nil && strings.HasPrefix(part.InlineData.MimeType, "image/") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isVideoGenerationResponse checks if the response contains video data
+func isVideoGenerationResponse(response *dto.GeminiChatResponse) bool {
+	if len(response.Candidates) == 0 {
+		return false
+	}
+
+	candidate := response.Candidates[0]
+	if len(candidate.Content.Parts) == 0 {
+		return false
+	}
+
+	// Check if any part contains video data
+	for _, part := range candidate.Content.Parts {
+		if part.InlineData != nil && strings.HasPrefix(part.InlineData.MimeType, "video/") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// handleVideoGenerationResponse processes video generation responses
+func handleVideoGenerationResponse(c *gin.Context, info *relaycommon.RelayInfo, geminiResponse *dto.GeminiChatResponse, originalBody []byte) (*dto.Usage, *types.NewAPIError) {
+	usage := dto.Usage{
+		PromptTokens:     geminiResponse.UsageMetadata.PromptTokenCount,
+		CompletionTokens: geminiResponse.UsageMetadata.CandidatesTokenCount,
+		TotalTokens:      geminiResponse.UsageMetadata.TotalTokenCount,
+	}
+
+	// Return original Gemini format for video generation
+	service.IOCopyBytesGracefully(c, nil, originalBody)
+	return &usage, nil
+}
+
+// handleImageGenerationResponse processes image generation responses
+func handleImageGenerationResponse(c *gin.Context, info *relaycommon.RelayInfo, geminiResponse *dto.GeminiChatResponse, originalBody []byte) (*dto.Usage, *types.NewAPIError) {
+	usage := dto.Usage{
+		PromptTokens:     geminiResponse.UsageMetadata.PromptTokenCount,
+		CompletionTokens: geminiResponse.UsageMetadata.CandidatesTokenCount,
+		TotalTokens:      geminiResponse.UsageMetadata.TotalTokenCount,
+	}
+
+	var responseBody []byte
+	var err error
+
+	switch info.RelayFormat {
+	case types.RelayFormatGemini:
+		// Return original Gemini format
+		responseBody = originalBody
+	default:
+		// Return Gemini format for image generation (no OpenAI conversion)
+		responseBody = originalBody
+	}
+
+	service.IOCopyBytesGracefully(c, nil, responseBody)
+	return &usage, nil
+}
+
 func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1221,6 +1300,17 @@ func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		//	return nil, types.NewOpenAIError(errors.New("empty response from Gemini API"), types.ErrorCodeEmptyResponse, http.StatusInternalServerError)
 		//}
 	}
+
+	// Check if this is a video generation response
+	if isVideoGenerationResponse(&geminiResponse) {
+		return handleVideoGenerationResponse(c, info, &geminiResponse, responseBody)
+	}
+
+	// Check if this is an image generation response
+	if isImageGenerationResponse(&geminiResponse) {
+		return handleImageGenerationResponse(c, info, &geminiResponse, responseBody)
+	}
+
 	fullTextResponse := responseGeminiChat2OpenAI(c, &geminiResponse)
 	fullTextResponse.Model = info.UpstreamModelName
 	usage := dto.Usage{

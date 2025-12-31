@@ -336,12 +336,27 @@ type GeminiChatGenerationConfig struct {
 	MediaResolution    MediaResolution       `json:"mediaResolution,omitempty"`
 	Seed               int64                 `json:"seed,omitempty"`
 	ResponseModalities []string              `json:"responseModalities,omitempty"`
+	NumberOfImages     int                   `json:"numberOfImages,omitempty"`     // Number of images to generate (1-4)
 	ThinkingConfig     *GeminiThinkingConfig `json:"thinkingConfig,omitempty"`
-	SpeechConfig       json.RawMessage       `json:"speechConfig,omitempty"` // RawMessage to allow flexible speech config
-	ImageConfig        json.RawMessage       `json:"imageConfig,omitempty"`  // RawMessage to allow flexible image config
+	SpeechConfig       json.RawMessage       `json:"speechConfig,omitempty"`       // RawMessage to allow flexible speech config
+	ImageConfig        *GeminiImageConfig    `json:"imageConfig,omitempty"`        // Image generation config
+	VideoConfig        *GeminiVideoConfig    `json:"videoConfig,omitempty"`        // Video generation config
 }
 
 type MediaResolution string
+
+// GeminiImageConfig represents the image generation configuration for Nano Banana models
+type GeminiImageConfig struct {
+	AspectRatio string `json:"aspectRatio,omitempty"` // "1:1", "16:9", "9:16", "4:3", "3:4"
+	ImageSize   string `json:"imageSize,omitempty"`   // "4K", "2K", "1K"
+}
+
+// GeminiVideoConfig represents the video generation configuration for Veo models
+type GeminiVideoConfig struct {
+	AspectRatio     string `json:"aspectRatio,omitempty"`     // "16:9", "9:16"
+	Resolution      string `json:"resolution,omitempty"`      // "720p", "1080p"
+	DurationSeconds string `json:"durationSeconds,omitempty"` // "4", "6", "8"
+}
 
 type GeminiChatCandidate struct {
 	Content       GeminiChatContent        `json:"content"`

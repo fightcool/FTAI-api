@@ -23,6 +23,22 @@ type Adaptor struct {
 }
 
 func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
+	// Check if this is a video generation request
+	if isVideoGenerationRequest(request) {
+		err := handleVideoGenerationRequest(request)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Check if this is an image generation request
+	if isImageGenerationRequest(request) {
+		err := handleImageGenerationRequest(request)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if len(request.Contents) > 0 {
 		for i, content := range request.Contents {
 			if i == 0 {
@@ -282,4 +298,121 @@ func (a *Adaptor) GetModelList() []string {
 
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
+}
+
+// isImageGenerationModel checks if the model supports image generation (Nano Banana models)
+func isImageGenerationModel(modelName string) bool {
+	return strings.HasPrefix(modelName, "gemini-2.5-flash-image") ||
+		strings.HasPrefix(modelName, "gemini-3-pro-image") ||
+		strings.HasPrefix(modelName, "gemini-2.0-flash-thinking-exp-image")
+}
+
+// isVideoGenerationModel checks if the model supports video generation (Veo models)
+func isVideoGenerationModel(modelName string) bool {
+	return strings.HasPrefix(modelName, "veo-")
+}
+
+// isVideoGenerationRequest checks if the request is for video generation
+func isVideoGenerationRequest(request *dto.GeminiChatRequest) bool {
+	if request.GenerationConfig.ResponseModalities == nil {
+		return false
+	}
+
+	// Check if responseModalities contains "VIDEO"
+	for _, modality := range request.GenerationConfig.ResponseModalities {
+		if modality == "VIDEO" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isImageGenerationRequest checks if the request is for image generation
+func isImageGenerationRequest(request *dto.GeminiChatRequest) bool {
+	if request.GenerationConfig.ResponseModalities == nil {
+		return false
+	}
+
+	// Check if responseModalities contains "IMAGE"
+	for _, modality := range request.GenerationConfig.ResponseModalities {
+		if modality == "IMAGE" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// handleImageGenerationRequest processes image generation requests
+func handleImageGenerationRequest(request *dto.GeminiChatRequest) error {
+	// 1. Validate required parameters
+	if !isImageGenerationRequest(request) {
+		return errors.New("responseModalities must include 'IMAGE' for image generation")
+	}
+
+	// 2. Set default values
+	if request.GenerationConfig.NumberOfImages == 0 {
+		request.GenerationConfig.NumberOfImages = 1
+	}
+
+	// 3. Reorder parts: images first, then text (required by Gemini API)
+	if len(request.Contents) > 0 && len(request.Contents[0].Parts) > 1 {
+		reorderPartsForImageGeneration(&request.Contents[0])
+	}
+
+	return nil
+}
+
+// reorderPartsForImageGeneration reorders parts to put images before text
+func reorderPartsForImageGeneration(content *dto.GeminiChatContent) {
+	var imageParts []dto.GeminiPart
+	var textParts []dto.GeminiPart
+
+	// Separate image and text parts
+	for _, part := range content.Parts {
+		if part.InlineData != nil {
+			imageParts = append(imageParts, part)
+		} else {
+			textParts = append(textParts, part)
+		}
+	}
+
+	// Reorder: images first, then text
+	content.Parts = append(imageParts, textParts...)
+}
+
+// handleVideoGenerationRequest processes video generation requests
+func handleVideoGenerationRequest(request *dto.GeminiChatRequest) error {
+	// 1. Validate required parameters
+	if !isVideoGenerationRequest(request) {
+		return errors.New("responseModalities must include 'VIDEO' for video generation")
+	}
+
+	// 2. Set default values
+	if request.GenerationConfig.VideoConfig == nil {
+		request.GenerationConfig.VideoConfig = &dto.GeminiVideoConfig{}
+	}
+
+	// Set default aspect ratio if not specified
+	if request.GenerationConfig.VideoConfig.AspectRatio == "" {
+		request.GenerationConfig.VideoConfig.AspectRatio = "16:9"
+	}
+
+	// Set default duration if not specified
+	if request.GenerationConfig.VideoConfig.DurationSeconds == "" {
+		request.GenerationConfig.VideoConfig.DurationSeconds = "8"
+	}
+
+	// Set default resolution if not specified
+	if request.GenerationConfig.VideoConfig.Resolution == "" {
+		request.GenerationConfig.VideoConfig.Resolution = "720p"
+	}
+
+	// 3. Reorder parts: images first, then text (for image-to-video)
+	if len(request.Contents) > 0 && len(request.Contents[0].Parts) > 1 {
+		reorderPartsForImageGeneration(&request.Contents[0])
+	}
+
+	return nil
 }
