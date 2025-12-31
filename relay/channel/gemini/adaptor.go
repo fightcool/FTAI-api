@@ -37,6 +37,18 @@ func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayIn
 		if err != nil {
 			return nil, err
 		}
+
+		// Log request details for debugging
+		if len(request.Contents) > 0 && len(request.Contents[0].Parts) > 0 {
+			logger.LogDebug(c, fmt.Sprintf("Image generation request with %d parts", len(request.Contents[0].Parts)))
+			for i, part := range request.Contents[0].Parts {
+				if part.InlineData != nil {
+					logger.LogDebug(c, fmt.Sprintf("Part %d: InlineData (mimeType: %s, size: %d bytes)", i, part.InlineData.MimeType, len(part.InlineData.Data)))
+				} else if part.Text != "" {
+					logger.LogDebug(c, fmt.Sprintf("Part %d: Text (length: %d)", i, len(part.Text)))
+				}
+			}
+		}
 	}
 
 	if len(request.Contents) > 0 {
