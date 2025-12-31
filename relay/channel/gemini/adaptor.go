@@ -351,10 +351,8 @@ func handleImageGenerationRequest(request *dto.GeminiChatRequest) error {
 		return errors.New("responseModalities must include 'IMAGE' for image generation")
 	}
 
-	// 2. Set default values
-	if request.GenerationConfig.NumberOfImages == 0 {
-		request.GenerationConfig.NumberOfImages = 1
-	}
+	// 2. Remove numberOfImages as it's not supported by Gemini API
+	request.GenerationConfig.NumberOfImages = 0
 
 	// 3. Reorder parts: images first, then text (required by Gemini API)
 	if len(request.Contents) > 0 && len(request.Contents[0].Parts) > 1 {
