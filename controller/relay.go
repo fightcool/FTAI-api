@@ -451,6 +451,7 @@ func RelayNotFound(c *gin.Context) {
 }
 
 func RelayTask(c *gin.Context) {
+	common.SysError(fmt.Sprintf("VIDEO DEBUG: RelayTask called, path: %s", c.Request.URL.Path))
 	retryTimes := common.RetryTimes
 	channelId := c.GetInt("channel_id")
 	c.Set("use_channel", []string{fmt.Sprintf("%d", channelId)})
@@ -459,6 +460,12 @@ func RelayTask(c *gin.Context) {
 		return
 	}
 	taskErr := taskRelayHandler(c, relayInfo)
+	common.SysError(fmt.Sprintf("VIDEO DEBUG: taskErr = %v, message = %s", taskErr != nil, func() string {
+		if taskErr != nil {
+			return taskErr.Message
+		}
+		return "nil"
+	}()))
 	if taskErr == nil {
 		retryTimes = 0
 	}

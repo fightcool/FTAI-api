@@ -38,9 +38,17 @@ type GeminiVideoGenerationConfig struct {
 	Resolution       string  `json:"resolution,omitempty"`       // video resolution
 }
 
+// GeminiImageData represents image data in Base64 format
+type GeminiImageData struct {
+	BytesBase64Encoded string `json:"bytesBase64Encoded"`
+	MimeType           string `json:"mimeType,omitempty"`
+}
+
 // GeminiVideoRequest represents a single video generation instance
 type GeminiVideoRequest struct {
-	Prompt string `json:"prompt"`
+	Prompt    string           `json:"prompt"`
+	Image     *GeminiImageData `json:"image,omitempty"`     // Starting image for image-to-video
+	LastFrame *GeminiImageData `json:"lastFrame,omitempty"` // Ending image for interpolation
 }
 
 // GeminiVideoPayload represents the complete video generation request payload
@@ -107,10 +115,15 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 // BuildRequestURL constructs the upstream URL.
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	modelName := info.OriginModelName
+
+	// Map frontend model names to Gemini API model names
+	modelName = mapModelName(modelName)
+
 	version := model_setting.GetGeminiVersionSetting(modelName)
 
+	// Use generateVideos for Gemini Veo API (not predictLongRunning)
 	return fmt.Sprintf(
-		"%s/%s/models/%s:predictLongRunning",
+		"%s/%s/models/%s:generateVideos",
 		a.baseURL,
 		version,
 		modelName,
@@ -127,23 +140,56 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info
 
 // BuildRequestBody converts request into Gemini specific format.
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
+	common.SysLog("BuildRequestBody: Starting to build request body")
 	v, ok := c.Get("task_request")
 	if !ok {
+		common.SysLog("BuildRequestBody: request not found in context")
 		return nil, fmt.Errorf("request not found in context")
 	}
 	req, ok := v.(relaycommon.TaskSubmitReq)
 	if !ok {
+		common.SysLog("BuildRequestBody: unexpected task_request type")
 		return nil, fmt.Errorf("unexpected task_request type")
 	}
+	common.SysLog(fmt.Sprintf("BuildRequestBody: Got request with prompt: %s, image: %s", req.Prompt, req.Image))
 
 	// Create structured video generation request
+	videoReq := GeminiVideoRequest{
+		Prompt: req.Prompt,
+	}
+
+	// Handle starting image (image-to-video)
+	if req.Image != "" {
+		imageData, err := downloadAndEncodeImage(req.Image)
+		if err != nil {
+			return nil, fmt.Errorf("failed to process starting image: %w", err)
+		}
+		videoReq.Image = &GeminiImageData{
+			BytesBase64Encoded: imageData,
+			MimeType:           "image/jpeg",
+		}
+	}
+
+	// Handle ending image (interpolation mode) from metadata
+	if req.Metadata != nil {
+		if lastFrameURL, ok := req.Metadata["lastFrame"].(string); ok && lastFrameURL != "" {
+			imageData, err := downloadAndEncodeImage(lastFrameURL)
+			if err != nil {
+				return nil, fmt.Errorf("failed to process ending image: %w", err)
+			}
+			videoReq.LastFrame = &GeminiImageData{
+				BytesBase64Encoded: imageData,
+				MimeType:           "image/jpeg",
+			}
+		}
+	}
+
 	body := GeminiVideoPayload{
-		Instances: []GeminiVideoRequest{
-			{Prompt: req.Prompt},
-		},
+		Instances:  []GeminiVideoRequest{videoReq},
 		Parameters: GeminiVideoGenerationConfig{},
 	}
 
+	// Parse metadata into parameters
 	metadata := req.Metadata
 	medaBytes, err := json.Marshal(metadata)
 	if err != nil {
@@ -187,12 +233,21 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	ov.TaskID = taskID
 	ov.CreatedAt = time.Now().Unix()
 	ov.Model = info.OriginModelName
+	ov.Status = dto.VideoStatusQueued // 设置初始状态为 "queued"
+	ov.Progress = 0                   // 设置初始进度为 0
 	c.JSON(http.StatusOK, ov)
 	return taskID, responseBody, nil
 }
 
 func (a *TaskAdaptor) GetModelList() []string {
-	return []string{"veo-3.0-generate-001", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"}
+	return []string{
+		"veo-3.0-generate-001",
+		"veo-3.1-generate-preview",
+		"veo-3.1-fast-generate-preview",
+		// 支持前端使用的简化模型名称
+		"veo3.1-fast",
+		"veo3.1-pro",
+	}
 }
 
 func (a *TaskAdaptor) GetChannelName() string {
@@ -231,6 +286,9 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy 
 }
 
 func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
+	// Debug: Log the raw response
+	common.SysLog(fmt.Sprintf("Gemini Veo Response: %s", string(respBody)))
+
 	var op operationResponse
 	if err := json.Unmarshal(respBody, &op); err != nil {
 		return nil, fmt.Errorf("unmarshal operation response failed: %w", err)
@@ -258,13 +316,17 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	ti.TaskID = taskID
 	ti.Url = fmt.Sprintf("%s/v1/videos/%s/content", system_setting.ServerAddress, taskID)
 
-	// Extract URL from generateVideoResponse if available
+	// Extract video URL according to Gemini Veo 3.1 official specification
+	// Gemini Veo returns video URI in generateVideoResponse.generatedSamples[].video.uri
 	if len(op.Response.GenerateVideoResponse.GeneratedSamples) > 0 {
 		if uri := op.Response.GenerateVideoResponse.GeneratedSamples[0].Video.URI; uri != "" {
 			ti.RemoteUrl = uri
+			common.SysLog(fmt.Sprintf("Gemini Veo: Found video URI: %s", uri))
+			return ti, nil
 		}
 	}
 
+	common.SysLog("Gemini Veo: Warning - No video URI found in response")
 	return ti, nil
 }
 
@@ -325,4 +387,76 @@ func extractModelFromOperationName(name string) string {
 		}
 	}
 	return ""
+}
+
+// downloadAndEncodeImage downloads an image from URL or decodes base64 data and returns base64 encoded string
+func downloadAndEncodeImage(imageInput string) (string, error) {
+	// Check if it's already base64 encoded data
+	if strings.HasPrefix(imageInput, "data:image/") {
+		// Extract base64 data from data URL
+		parts := strings.SplitN(imageInput, ",", 2)
+		if len(parts) == 2 {
+			return parts[1], nil
+		}
+		return "", fmt.Errorf("invalid data URL format")
+	}
+
+	// Check if it's raw base64 (no data: prefix)
+	if !strings.HasPrefix(imageInput, "http://") && !strings.HasPrefix(imageInput, "https://") {
+		// Assume it's already base64 encoded
+		return imageInput, nil
+	}
+
+	// Download image from URL
+	client := service.GetHttpClient()
+
+	// Create request with browser-like headers to avoid 403 errors from OSS
+	req, err := http.NewRequest("GET", imageInput, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Add browser-like headers
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// Read error response body for debugging
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		common.SysLog(fmt.Sprintf("Failed to download image from %s: status %d, body: %s", imageInput, resp.StatusCode, string(bodyBytes)))
+		return "", fmt.Errorf("failed to download image from URL (status %d): image URL may be expired or inaccessible", resp.StatusCode)
+	}
+
+	// Read image data
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read image data: %w", err)
+	}
+
+	// Encode to base64
+	return base64.StdEncoding.EncodeToString(imageData), nil
+}
+
+// mapModelName maps frontend model names to Gemini API model names
+func mapModelName(modelName string) string {
+	modelMap := map[string]string{
+		// Map frontend simplified names to Gemini API names
+		"veo3.1-fast": "veo-3.1-fast-generate-preview",
+		"veo3.1-pro":  "veo-3.1-generate-preview",
+	}
+
+	if mappedName, exists := modelMap[modelName]; exists {
+		return mappedName
+	}
+
+	// Return original name if no mapping exists
+	return modelName
 }

@@ -5,6 +5,7 @@ import (
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relay"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -175,8 +176,28 @@ func SetRelayRouter(router *gin.Engine) {
 	relayGeminiRouter.Use(middleware.Distribute())
 	{
 		// Gemini API 路径格式: /v1beta/models/{model_name}:{action}
+		// 支持文本生成和视频生成
 		relayGeminiRouter.POST("/models/*path", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
+			// 检查是否是视频生成请求（由 middleware 设置）
+			if platform, exists := c.Get("platform"); exists && platform == "gemini" {
+				// 视频生成请求
+				controller.RelayTask(c)
+			} else {
+				// 文本生成请求
+				controller.Relay(c, types.RelayFormatGemini)
+			}
+		})
+		// 支持 GET 请求查询视频生成状态
+		relayGeminiRouter.GET("/models/*path", func(c *gin.Context) {
+			// 检查是否是视频状态查询（由 middleware 设置）
+			if relayMode, exists := c.Get("relay_mode"); exists {
+				if relayMode == relayconstant.RelayModeVideoFetchByID {
+					controller.RelayTask(c)
+					return
+				}
+			}
+			// 其他 GET 请求返回 404
+			c.JSON(404, gin.H{"error": "not found"})
 		})
 	}
 }

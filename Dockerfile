@@ -21,8 +21,13 @@ WORKDIR /build
 ADD go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+# 先复制前端构建产物，确保 go:embed 能找到文件
 COPY --from=builder /build/dist ./web/dist
+
+# 再复制 Go 源代码
+COPY . .
+
+# 编译 Go 程序（此时 web/dist 已经存在）
 RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
 
 FROM debian:bookworm-slim
@@ -33,6 +38,7 @@ RUN apt-get update \
     && update-ca-certificates
 
 COPY --from=builder2 /build/new-api /
+COPY --from=builder2 /build/web/dist /web/dist
 EXPOSE 3000
 WORKDIR /data
 ENTRYPOINT ["/new-api"]

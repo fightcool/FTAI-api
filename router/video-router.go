@@ -13,9 +13,15 @@ func SetVideoRouter(router *gin.Engine) {
 	{
 		videoV1Router.GET("/videos/:task_id/content", controller.VideoProxy)
 		videoV1Router.POST("/video/generations", controller.RelayTask)
+		videoV1Router.POST("/video/create", controller.RelayTask)
 		videoV1Router.GET("/video/generations/:task_id", controller.RelayTask)
 		videoV1Router.POST("/videos/:video_id/remix", controller.RelayTask)
 	}
+
+	// Note: Google Gemini Veo API routes (/v1beta/models/*) are handled by middleware.Distribute()
+	// The middleware detects video generation requests and routes them to RelayTask automatically
+	// See middleware/distributor.go for the routing logic
+
 	// openai compatible API video routes
 	// docs: https://platform.openai.com/docs/api-reference/videos/create
 	{

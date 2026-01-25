@@ -534,6 +534,7 @@ func (t *TaskSubmitReq) HasImage() bool {
 func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 	type Alias TaskSubmitReq
 	aux := &struct {
+		Image    json.RawMessage `json:"image,omitempty"`
 		Metadata json.RawMessage `json:"metadata,omitempty"`
 		*Alias
 	}{
@@ -542,6 +543,23 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 
 	if err := common.Unmarshal(data, &aux); err != nil {
 		return err
+	}
+
+	// Handle image field - support both string and object format
+	if len(aux.Image) > 0 {
+		// Try to unmarshal as string first
+		var imageStr string
+		if err := common.Unmarshal(aux.Image, &imageStr); err == nil {
+			t.Image = imageStr
+		} else {
+			// Try to unmarshal as object with bytesBase64Encoded field
+			var imageObj struct {
+				BytesBase64Encoded string `json:"bytesBase64Encoded"`
+			}
+			if err := common.Unmarshal(aux.Image, &imageObj); err == nil && imageObj.BytesBase64Encoded != "" {
+				t.Image = imageObj.BytesBase64Encoded
+			}
+		}
 	}
 
 	if len(aux.Metadata) > 0 {
@@ -557,6 +575,15 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 		var metadataObj map[string]interface{}
 		if err := common.Unmarshal(aux.Metadata, &metadataObj); err == nil {
 			t.Metadata = metadataObj
+
+			// Handle lastFrame in metadata - convert object format to string
+			if lastFrame, ok := metadataObj["lastFrame"]; ok {
+				if lastFrameMap, ok := lastFrame.(map[string]interface{}); ok {
+					if bytesBase64, ok := lastFrameMap["bytesBase64Encoded"].(string); ok && bytesBase64 != "" {
+						t.Metadata["lastFrame"] = bytesBase64
+					}
+				}
+			}
 		}
 	}
 

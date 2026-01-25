@@ -227,14 +227,44 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		if _, ok := c.Get("relay_mode"); !ok {
 			c.Set("relay_mode", relayMode)
 		}
-	} else if strings.HasPrefix(c.Request.URL.Path, "/v1beta/models/") || strings.HasPrefix(c.Request.URL.Path, "/v1/models/") {
-		// Gemini API 路径处理: /v1beta/models/gemini-2.0-flash:generateContent
-		relayMode := relayconstant.RelayModeGemini
-		modelName := extractModelNameFromGeminiPath(c.Request.URL.Path)
-		if modelName != "" {
-			modelRequest.Model = modelName
+	} else if strings.Contains(c.Request.URL.Path, "/v1/video/create") {
+		// Handle /v1/video/create endpoint (Gemini Veo compatible)
+		relayMode := relayconstant.RelayModeUnknown
+		if c.Request.Method == http.MethodPost {
+			req, err := getModelFromRequest(c)
+			if err != nil {
+				return nil, false, err
+			}
+			modelRequest.Model = req.Model
+			relayMode = relayconstant.RelayModeVideoSubmit
 		}
 		c.Set("relay_mode", relayMode)
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1beta/models/") || strings.HasPrefix(c.Request.URL.Path, "/v1/models/") {
+		// Gemini API 路径处理
+		// 检查是否是视频生成请求 (Veo API)
+		if strings.Contains(c.Request.URL.Path, ":predictLongRunning") || strings.Contains(c.Request.URL.Path, ":generateVideos") {
+			// Veo 视频生成 API: /v1beta/models/veo-3.1-generate-preview:predictLongRunning
+			relayMode := relayconstant.RelayModeVideoSubmit
+			modelName := extractModelNameFromGeminiPath(c.Request.URL.Path)
+			if modelName != "" {
+				modelRequest.Model = modelName
+			}
+			c.Set("relay_mode", relayMode)
+			c.Set("platform", string(constant.TaskPlatformGemini))
+		} else if strings.Contains(c.Request.URL.Path, "/operations/") {
+			// Veo 任务状态查询: /v1beta/models/veo-3.1-generate-preview/operations/xxx
+			relayMode := relayconstant.RelayModeVideoFetchByID
+			shouldSelectChannel = false
+			c.Set("relay_mode", relayMode)
+		} else {
+			// Gemini 文本生成 API: /v1beta/models/gemini-2.0-flash:generateContent
+			relayMode := relayconstant.RelayModeGemini
+			modelName := extractModelNameFromGeminiPath(c.Request.URL.Path)
+			if modelName != "" {
+				modelRequest.Model = modelName
+			}
+			c.Set("relay_mode", relayMode)
+		}
 	} else if !strings.HasPrefix(c.Request.URL.Path, "/v1/audio/transcriptions") && !strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
 		req, err := getModelFromRequest(c)
 		if err != nil {
@@ -363,8 +393,9 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 }
 
 // extractModelNameFromGeminiPath 从 Gemini API URL 路径中提取模型名
-// 输入格式: /v1beta/models/gemini-2.0-flash:generateContent
-// 输出: gemini-2.0-flash
+// 输入格式:
+//   - /v1beta/models/gemini-2.0-flash:generateContent -> gemini-2.0-flash
+//   - /v1beta/models/veo-3.1-fast-generate-preview/operations/xxxxx -> veo-3.1-fast-generate-preview
 func extractModelNameFromGeminiPath(path string) string {
 	// 查找 "/models/" 的位置
 	modelsPrefix := "/models/"
@@ -379,13 +410,18 @@ func extractModelNameFromGeminiPath(path string) string {
 		return ""
 	}
 
-	// 查找 ":" 的位置，模型名在 ":" 之前
+	// 查找 ":" 的位置，模型名在 ":" 之前（Gemini 文本生成 API）
 	colonIndex := strings.Index(path[startIndex:], ":")
-	if colonIndex == -1 {
-		// 如果没有找到 ":"，返回从 "/models/" 到路径结尾的部分
-		return path[startIndex:]
+	if colonIndex != -1 {
+		return path[startIndex : startIndex+colonIndex]
 	}
 
-	// 返回模型名部分
-	return path[startIndex : startIndex+colonIndex]
+	// 查找 "/operations/" 的位置，模型名在 "/operations/" 之前（Gemini Veo 视频生成 API）
+	operationsIndex := strings.Index(path[startIndex:], "/operations/")
+	if operationsIndex != -1 {
+		return path[startIndex : startIndex+operationsIndex]
+	}
+
+	// 如果都没有找到，返回从 "/models/" 到路径结尾的部分
+	return path[startIndex:]
 }
