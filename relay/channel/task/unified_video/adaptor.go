@@ -1,0 +1,384 @@
+package unified_video
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+
+	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
+)
+
+// ============================
+// Request / Response structures
+// ============================
+
+// upstreamVideoRequest 上游 API 期望的请求格式
+type upstreamVideoRequest struct {
+	Model          string   `json:"model"`
+	Prompt         string   `json:"prompt"`
+	Images         []string `json:"images,omitempty"`
+	EnhancePrompt  bool     `json:"enhance_prompt,omitempty"`
+	EnableUpsample bool     `json:"enable_upsample,omitempty"`
+	AspectRatio    string   `json:"aspect_ratio,omitempty"`
+}
+
+// responseTask 上游 API 响应格式
+type responseTask struct {
+	ID               string `json:"id"`
+	TaskID           string `json:"task_id,omitempty"`
+	Object           string `json:"object,omitempty"`
+	Status           string `json:"status"`
+	StatusUpdateTime int64  `json:"status_update_time,omitempty"`
+	Progress         int    `json:"progress,omitempty"`
+	CreatedAt        int64  `json:"created_at,omitempty"`
+	// 视频 URL 字段（不同上游 API 可能使用不同字段名）
+	URL       string `json:"url,omitempty"`
+	VideoURL  string `json:"video_url,omitempty"`
+	OutputURL string `json:"output_url,omitempty"`
+	Error     *struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	} `json:"error,omitempty"`
+}
+
+// ============================
+// Adaptor implementation
+// ============================
+
+type TaskAdaptor struct {
+	ChannelType   int
+	apiKey        string
+	baseURL       string
+	convertedBody []byte
+}
+
+func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
+	a.ChannelType = info.ChannelType
+	a.baseURL = info.ChannelBaseUrl
+	a.apiKey = info.ApiKey
+}
+
+func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
+	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate)
+}
+
+// BuildRequestURL 构建请求 URL，支持自定义端点
+func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	path := a.getEndpointPath(info)
+	url := fmt.Sprintf("%s%s", a.baseURL, path)
+	common.SysLog(fmt.Sprintf("UnifiedVideo adaptor: Request URL: %s", url))
+	return url, nil
+}
+
+// getEndpointPath 获取端点路径，支持从渠道配置中自定义
+func (a *TaskAdaptor) getEndpointPath(info *relaycommon.RelayInfo) string {
+	// 默认端点路径
+	defaultPath := "/v1/video/create"
+
+	// 如果渠道配置了自定义端点路径，优先使用
+	if info.ChannelMeta != nil && info.ChannelMeta.ChannelSetting.EndpointPaths != nil {
+		if customPath, ok := info.ChannelMeta.ChannelSetting.EndpointPaths[info.Action]; ok && customPath != "" {
+			common.SysLog(fmt.Sprintf("UnifiedVideo adaptor: Using custom endpoint path: %s", customPath))
+			return customPath
+		}
+		// 也支持通用的 "generate" key
+		if customPath, ok := info.ChannelMeta.ChannelSetting.EndpointPaths["generate"]; ok && customPath != "" {
+			common.SysLog(fmt.Sprintf("UnifiedVideo adaptor: Using custom endpoint path: %s", customPath))
+			return customPath
+		}
+	}
+
+	return defaultPath
+}
+
+// BuildRequestHeader 设置请求头
+func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info *relaycommon.RelayInfo) error {
+	req.Header.Set("Authorization", "Bearer "+a.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	return nil
+}
+
+// BuildRequestBody 构建请求体，将 ftai-movies 格式转换为上游 API 格式
+func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
+	v, exists := c.Get("task_request")
+	if !exists {
+		return nil, fmt.Errorf("request not found in context")
+	}
+	req := v.(relaycommon.TaskSubmitReq)
+
+	// 转换为上游 API 格式
+	upstreamReq := a.convertToUpstreamFormat(&req, info)
+
+	data, err := json.Marshal(upstreamReq)
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal upstream request failed")
+	}
+
+	common.SysLog(fmt.Sprintf("UnifiedVideo adaptor: Converted request: %s", string(data)))
+	a.convertedBody = data
+	return bytes.NewReader(data), nil
+}
+
+// convertToUpstreamFormat 将 ftai-movies 的请求格式转换为上游 API 格式
+func (a *TaskAdaptor) convertToUpstreamFormat(req *relaycommon.TaskSubmitReq, info *relaycommon.RelayInfo) *upstreamVideoRequest {
+	upstreamReq := &upstreamVideoRequest{
+		Prompt:        req.Prompt,
+		EnhancePrompt: true, // 默认开启中文转英文
+	}
+
+	// 使用映射后的模型名称
+	if info.UpstreamModelName != "" {
+		upstreamReq.Model = info.UpstreamModelName
+	} else {
+		upstreamReq.Model = req.Model
+	}
+
+	// 处理图片：将 image 和 lastFrame 合并到 images 数组
+	var images []string
+	if req.Image != "" {
+		images = append(images, req.Image)
+	}
+	// 也支持 Images 数组
+	if len(req.Images) > 0 {
+		images = append(images, req.Images...)
+	}
+
+	// 从 metadata 中提取 lastFrame
+	if req.Metadata != nil {
+		if lastFrame, ok := req.Metadata["lastFrame"].(string); ok && lastFrame != "" {
+			images = append(images, lastFrame)
+		}
+		// 处理 aspectRatio
+		if aspectRatio, ok := req.Metadata["aspectRatio"].(string); ok && aspectRatio != "" {
+			upstreamReq.AspectRatio = aspectRatio
+		}
+		// 处理 enhance_prompt
+		if enhancePrompt, ok := req.Metadata["enhance_prompt"].(bool); ok {
+			upstreamReq.EnhancePrompt = enhancePrompt
+		}
+		// 处理 enable_upsample
+		if enableUpsample, ok := req.Metadata["enable_upsample"].(bool); ok {
+			upstreamReq.EnableUpsample = enableUpsample
+		}
+	}
+
+	if len(images) > 0 {
+		upstreamReq.Images = images
+	}
+
+	// 如果没有设置 aspectRatio，根据 size 推断
+	if upstreamReq.AspectRatio == "" && req.Size != "" {
+		upstreamReq.AspectRatio = sizeToAspectRatio(req.Size)
+	}
+
+	return upstreamReq
+}
+
+// sizeToAspectRatio 将尺寸转换为宽高比
+func sizeToAspectRatio(size string) string {
+	switch size {
+	case "1920x1080", "1280x720":
+		return "16:9"
+	case "1080x1920", "720x1280":
+		return "9:16"
+	case "1024x1024":
+		return "1:1"
+	default:
+		if strings.Contains(size, "x") {
+			parts := strings.Split(size, "x")
+			if len(parts) == 2 {
+				if parts[0] > parts[1] {
+					return "16:9"
+				} else if parts[0] < parts[1] {
+					return "9:16"
+				}
+				return "1:1"
+			}
+		}
+		return "16:9"
+	}
+}
+
+// DoRequest 发送请求
+func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	return channel.DoTaskApiRequest(a, c, info, requestBody)
+}
+
+// DoResponse 处理响应
+func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
+		return
+	}
+	_ = resp.Body.Close()
+
+	common.SysLog(fmt.Sprintf("UnifiedVideo adaptor: Response status: %d, body: %s", resp.StatusCode, string(responseBody)))
+
+	// 检查 HTTP 状态码
+	if resp.StatusCode != http.StatusOK {
+		taskErr = service.TaskErrorWrapper(
+			fmt.Errorf("upstream returned status %d: %s", resp.StatusCode, string(responseBody)),
+			"upstream_error",
+			resp.StatusCode,
+		)
+		return
+	}
+
+	// 解析响应
+	var dResp responseTask
+	if err := common.Unmarshal(responseBody, &dResp); err != nil {
+		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+		return
+	}
+
+	// 获取任务 ID
+	if dResp.ID == "" && dResp.TaskID != "" {
+		dResp.ID = dResp.TaskID
+	}
+	if dResp.ID == "" {
+		taskErr = service.TaskErrorWrapper(fmt.Errorf("task_id is empty, response: %s", string(responseBody)), "invalid_response", http.StatusInternalServerError)
+		return
+	}
+
+	// 返回 OpenAI 兼容格式
+	openAIResp := dto.NewOpenAIVideo()
+	openAIResp.ID = dResp.ID
+	openAIResp.TaskID = dResp.ID
+	openAIResp.Status = dResp.Status
+	openAIResp.Model = info.OriginModelName
+	if dResp.CreatedAt > 0 {
+		openAIResp.CreatedAt = dResp.CreatedAt
+	}
+
+	c.JSON(http.StatusOK, openAIResp)
+	return dResp.ID, responseBody, nil
+}
+
+// FetchTask 获取任务状态
+func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
+	taskID, ok := body["task_id"].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid task_id")
+	}
+
+	// 默认使用 /v1/video/query?id=xxx 端点（VectorEngine 格式）
+	uri := fmt.Sprintf("%s/v1/video/query?id=%s", baseUrl, taskID)
+
+	// 如果有自定义的查询端点，使用自定义端点
+	if fetchPath, ok := body["fetch_path"].(string); ok && fetchPath != "" {
+		uri = fmt.Sprintf("%s%s?id=%s", baseUrl, fetchPath, taskID)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, uri, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Accept", "application/json")
+
+	client, err := service.GetHttpClientWithProxy(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("new proxy http client failed: %w", err)
+	}
+	return client.Do(req)
+}
+
+func (a *TaskAdaptor) GetModelList() []string {
+	return ModelList
+}
+
+func (a *TaskAdaptor) GetChannelName() string {
+	return ChannelName
+}
+
+func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
+	resTask := responseTask{}
+	if err := common.Unmarshal(respBody, &resTask); err != nil {
+		return nil, errors.Wrap(err, "unmarshal task result failed")
+	}
+
+	taskResult := relaycommon.TaskInfo{
+		Code: 0,
+	}
+
+	// 🔥 从上游响应中提取视频 URL（不同 API 可能使用不同字段名）
+	upstreamVideoURL := resTask.URL
+	if upstreamVideoURL == "" {
+		upstreamVideoURL = resTask.VideoURL
+	}
+	if upstreamVideoURL == "" {
+		upstreamVideoURL = resTask.OutputURL
+	}
+
+	switch resTask.Status {
+	case "queued", "pending":
+		taskResult.Status = model.TaskStatusQueued
+	case "processing", "in_progress", "video_generating", "image_uploading", "image_processing":
+		// 🔥 添加 video_generating 等中间状态的处理
+		taskResult.Status = model.TaskStatusInProgress
+	case "completed", "succeeded", "success":
+		taskResult.Status = model.TaskStatusSuccess
+		taskResult.Url = fmt.Sprintf("%s/v1/videos/%s/content", system_setting.ServerAddress, resTask.ID)
+		taskResult.Progress = "100%" // 任务完成时强制设置进度为100%
+		// 🔥 设置 RemoteUrl 为上游实际视频 URL，供 VideoProxy 使用
+		if upstreamVideoURL != "" {
+			taskResult.RemoteUrl = upstreamVideoURL
+		}
+	case "failed", "cancelled", "error":
+		taskResult.Status = model.TaskStatusFailure
+		if resTask.Error != nil {
+			taskResult.Reason = resTask.Error.Message
+		} else {
+			taskResult.Reason = "task failed"
+		}
+	default:
+		// 未知状态，保持 pending
+		taskResult.Status = model.TaskStatusQueued
+	}
+
+	if resTask.Progress > 0 && resTask.Progress < 100 {
+		taskResult.Progress = fmt.Sprintf("%d%%", resTask.Progress)
+	}
+
+	return &taskResult, nil
+}
+
+func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
+	openAIVideo := dto.NewOpenAIVideo()
+	openAIVideo.ID = task.TaskID
+	openAIVideo.Status = task.Status.ToVideoStatus()
+	openAIVideo.SetProgressStr(task.Progress)
+
+	// 🔥 任务成功时，FailReason 字段存储的是视频 URL（历史遗留设计）
+	if task.Status == model.TaskStatusSuccess && task.FailReason != "" {
+		openAIVideo.SetMetadata("url", task.FailReason)
+	}
+
+	if task.Data != nil {
+		var resTask responseTask
+		if err := common.Unmarshal(task.Data, &resTask); err == nil {
+			if resTask.CreatedAt > 0 {
+				openAIVideo.CreatedAt = resTask.CreatedAt
+			}
+		}
+	}
+
+	jsonData, _ := common.Marshal(openAIVideo)
+	return jsonData, nil
+}

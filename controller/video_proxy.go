@@ -17,6 +17,17 @@ import (
 )
 
 func VideoProxy(c *gin.Context) {
+	// 🔥 添加 CORS 头，允许浏览器跨域访问视频内容
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Access-Control-Allow-Methods", "GET, OPTIONS")
+	c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	// 处理 OPTIONS 预检请求
+	if c.Request.Method == "OPTIONS" {
+		c.AbortWithStatus(http.StatusNoContent)
+		return
+	}
+
 	taskID := c.Param("task_id")
 	if taskID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -106,6 +117,7 @@ func VideoProxy(c *gin.Context) {
 
 	switch channel.Type {
 	case constant.ChannelTypeGemini:
+		// Gemini 渠道使用 Gemini API 获取视频
 		apiKey := task.PrivateData.Key
 		if apiKey == "" {
 			logger.LogError(c.Request.Context(), fmt.Sprintf("Missing stored API key for Gemini task %s", taskID))
@@ -130,6 +142,36 @@ func VideoProxy(c *gin.Context) {
 			return
 		}
 		req.Header.Set("x-goog-api-key", apiKey)
+	case constant.ChannelTypeUnifiedVideo:
+		// 🔥 UnifiedVideo 渠道：直接构造上游视频内容 URL
+		// VectorEngine 格式: {baseURL}/v1/video/content?id={task_id}
+		apiKey := task.PrivateData.Key
+		if apiKey == "" {
+			logger.LogError(c.Request.Context(), fmt.Sprintf("Missing stored API key for UnifiedVideo task %s", taskID))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": gin.H{
+					"message": "API key not stored for task",
+					"type":    "server_error",
+				},
+			})
+			return
+		}
+
+		// 确保 baseURL 不为空
+		if baseURL == "" {
+			logger.LogError(c.Request.Context(), fmt.Sprintf("UnifiedVideo channel %d has no baseURL configured", channel.Id))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": gin.H{
+					"message": "Channel baseURL not configured",
+					"type":    "server_error",
+				},
+			})
+			return
+		}
+
+		videoURL = fmt.Sprintf("%s/v1/video/content?id=%s", baseURL, task.TaskID)
+		logger.LogInfo(c.Request.Context(), fmt.Sprintf("UnifiedVideo: Fetching video from: %s", videoURL))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	case constant.ChannelTypeOpenAI, constant.ChannelTypeSora:
 		videoURL = fmt.Sprintf("%s/v1/videos/%s/content", baseURL, task.TaskID)
 		req.Header.Set("Authorization", "Bearer "+channel.Key)

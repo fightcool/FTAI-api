@@ -8,10 +8,15 @@ import (
 )
 
 func SetVideoRouter(router *gin.Engine) {
+	// 🔥 公开访问的视频内容接口（不需要认证，task_id 本身提供安全性）
+	videoPublicRouter := router.Group("/v1")
+	{
+		videoPublicRouter.GET("/videos/:task_id/content", controller.VideoProxy)
+	}
+
 	videoV1Router := router.Group("/v1")
 	videoV1Router.Use(middleware.TokenAuth(), middleware.Distribute())
 	{
-		videoV1Router.GET("/videos/:task_id/content", controller.VideoProxy)
 		videoV1Router.POST("/video/generations", controller.RelayTask)
 		videoV1Router.POST("/video/create", controller.RelayTask)
 		videoV1Router.GET("/video/generations/:task_id", controller.RelayTask)
