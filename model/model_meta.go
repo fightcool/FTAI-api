@@ -2,6 +2,7 @@ package model
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -148,6 +149,7 @@ func SearchModels(keyword string, vendor string, offset int, limit int) ([]*Mode
 }
 
 // GetModelTagsMap 批量获取模型的 tags，返回 modelName -> tags 的映射
+// 🔥 支持精确匹配和模糊匹配（去掉常见前缀如 doubao-）
 func GetModelTagsMap(modelNames []string) (map[string]string, error) {
 	result := make(map[string]string)
 	if len(modelNames) == 0 {
@@ -165,5 +167,42 @@ func GetModelTagsMap(modelNames []string) (map[string]string, error) {
 			result[m.ModelName] = m.Tags
 		}
 	}
+
+	// 🔥 对于没有找到 tags 的模型，尝试模糊匹配
+	// 常见前缀：doubao-, openai-, google-, anthropic- 等
+	prefixes := []string{"doubao-", "openai-", "google-", "anthropic-", "azure-", "volcengine-"}
+	var unmatchedNames []string
+	unmatchedMap := make(map[string]string) // 去掉前缀后的名称 -> 原始名称
+
+	for _, name := range modelNames {
+		if _, ok := result[name]; !ok {
+			// 尝试去掉前缀
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(strings.ToLower(name), prefix) {
+					stripped := name[len(prefix):]
+					unmatchedNames = append(unmatchedNames, stripped)
+					unmatchedMap[stripped] = name
+					break
+				}
+			}
+		}
+	}
+
+	// 查询去掉前缀后的模型名称
+	if len(unmatchedNames) > 0 {
+		var fallbackModels []Model
+		err := DB.Select("model_name, tags").Where("model_name IN ?", unmatchedNames).Find(&fallbackModels).Error
+		if err == nil {
+			for _, m := range fallbackModels {
+				if m.Tags != "" {
+					// 使用原始名称作为 key
+					if originalName, ok := unmatchedMap[m.ModelName]; ok {
+						result[originalName] = m.Tags
+					}
+				}
+			}
+		}
+	}
+
 	return result, nil
 }
