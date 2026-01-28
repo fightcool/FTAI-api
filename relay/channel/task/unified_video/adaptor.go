@@ -41,8 +41,10 @@ type upstreamVideoRequest struct {
 // 2. 嵌套格式：{ "status": "FAILURE", "data": { "id": "xxx", "status": "failed", ... } }
 type responseTask struct {
 	// 顶层字段（扁平格式或嵌套格式的外层）
-	// 🔥 ID 使用 json.Number 兼容数字和字符串两种格式
-	ID               json.Number `json:"id"`
+	// 🔥 ID 使用 interface{} 兼容数字和任意字符串两种格式
+	// 数字格式: 123 或 "123"
+	// 字符串格式: "veo3.1-fast:1769574608-xxx"
+	ID               interface{} `json:"id"`
 	TaskID           string      `json:"task_id,omitempty"`
 	Object           string      `json:"object,omitempty"`
 	Status           string      `json:"status"`
@@ -274,8 +276,20 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 		return
 	}
 
-	// 获取任务 ID（兼容 json.Number 和 string 两种格式）
-	taskIDStr := dResp.ID.String()
+	// 🔥 获取任务 ID（兼容 数字、json.Number、string 等多种格式）
+	taskIDStr := ""
+	switch v := dResp.ID.(type) {
+	case string:
+		taskIDStr = v
+	case float64:
+		taskIDStr = fmt.Sprintf("%.0f", v)
+	case json.Number:
+		taskIDStr = v.String()
+	case nil:
+		// ID 为空，尝试使用 TaskID
+	default:
+		taskIDStr = fmt.Sprintf("%v", v)
+	}
 	if taskIDStr == "" && dResp.TaskID != "" {
 		taskIDStr = dResp.TaskID
 	}
