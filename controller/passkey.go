@@ -256,6 +256,10 @@ func PasskeyLoginFinish(c *gin.Context) {
 		return
 	}
 
+	// 用于在 handler 中保存找到的用户和凭证
+	var foundUser *model.User
+	var foundCredential *model.PasskeyCredential
+
 	handler := func(rawID, userHandle []byte) (webauthnlib.User, error) {
 		// 首先通过凭证ID查找用户
 		credential, err := model.GetPasskeyByCredentialID(rawID)
@@ -283,46 +287,33 @@ func PasskeyLoginFinish(c *gin.Context) {
 			}
 		}
 
+		// 保存找到的用户和凭证
+		foundUser = user
+		foundCredential = credential
+
 		return passkeysvc.NewWebAuthnUser(user, credential), nil
 	}
 
-	waUser, err := wa.FinishDiscoverableLogin(handler, *sessionData, c.Request)
+	_, err = wa.FinishDiscoverableLogin(handler, *sessionData, c.Request)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 
-	userWrapper, ok := waUser.(*passkeysvc.WebAuthnUser)
-	if !ok {
+	if foundUser == nil || foundCredential == nil {
 		common.ApiErrorMsg(c, "Passkey 登录状态异常")
 		return
 	}
 
-	modelUser := userWrapper.ModelUser()
-	if modelUser == nil {
-		common.ApiErrorMsg(c, "Passkey 登录状态异常")
-		return
-	}
-
-	if modelUser.Status != common.UserStatusEnabled {
-		common.ApiErrorMsg(c, "该用户已被禁用")
-		return
-	}
-
-	// 更新凭证信息（从 userWrapper 获取 credential）
-	credential := userWrapper.PasskeyCredential()
-	if credential == nil {
-		common.ApiErrorMsg(c, "Passkey 凭证获取失败")
-		return
-	}
+	// 更新凭证信息
 	now := time.Now()
-	credential.LastUsedAt = &now
-	if err := model.UpsertPasskeyCredential(credential); err != nil {
+	foundCredential.LastUsedAt = &now
+	if err := model.UpsertPasskeyCredential(foundCredential); err != nil {
 		common.ApiError(c, err)
 		return
 	}
 
-	setupLogin(modelUser, c)
+	setupLogin(foundUser, c)
 	return
 }
 
