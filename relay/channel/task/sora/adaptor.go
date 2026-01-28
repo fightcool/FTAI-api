@@ -93,7 +93,36 @@ func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, erro
 	if info.Action == constant.TaskActionRemix {
 		return fmt.Sprintf("%s/v1/videos/%s/remix", a.baseURL, info.OriginTaskID), nil
 	}
-	return fmt.Sprintf("%s/v1/videos", a.baseURL), nil
+	// 获取端点路径，支持从渠道配置中自定义
+	path := a.getEndpointPath(info)
+	return fmt.Sprintf("%s%s", a.baseURL, path), nil
+}
+
+// getEndpointPath 获取端点路径，支持从渠道配置中自定义
+func (a *TaskAdaptor) getEndpointPath(info *relaycommon.RelayInfo) string {
+	// 默认端点路径映射
+	defaultPaths := map[string]string{
+		constant.TaskActionGenerate:     "/v1/videos",
+		constant.TaskActionTextGenerate: "/v1/videos",
+	}
+
+	// 如果渠道配置了自定义端点路径，优先使用
+	if info.ChannelMeta != nil {
+		if info.ChannelMeta.ChannelSetting.EndpointPaths != nil {
+			if customPath, ok := info.ChannelMeta.ChannelSetting.EndpointPaths[info.Action]; ok && customPath != "" {
+				common.SysLog(fmt.Sprintf("Sora adaptor: Using custom endpoint path: %s for action: %s", customPath, info.Action))
+				return customPath
+			}
+		}
+	}
+
+	// 使用默认路径
+	if path, ok := defaultPaths[info.Action]; ok {
+		return path
+	}
+
+	// 兜底：默认使用 /v1/videos
+	return "/v1/videos"
 }
 
 // BuildRequestHeader sets required headers.

@@ -181,6 +181,7 @@ func InitDB() (err error) {
 			db = db.Debug()
 		}
 		DB = db
+		common.DB = db // 同步到 common 包供 ftai 子包使用
 		// MySQL charset/collation startup check: ensure Chinese-capable charset
 		if common.UsingMySQL {
 			if err := checkMySQLChineseSupport(DB); err != nil {

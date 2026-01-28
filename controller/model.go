@@ -202,6 +202,22 @@ func ListModels(c *gin.Context, modelType int) {
 		}
 	}
 
+	// 🔥 获取模型的 tags 并填充到返回数据中
+	if len(userOpenAiModels) > 0 {
+		modelNames := make([]string, len(userOpenAiModels))
+		for i, m := range userOpenAiModels {
+			modelNames[i] = m.Id
+		}
+		tagsMap, err := model.GetModelTagsMap(modelNames)
+		if err == nil && len(tagsMap) > 0 {
+			for i := range userOpenAiModels {
+				if tags, ok := tagsMap[userOpenAiModels[i].Id]; ok {
+					userOpenAiModels[i].Tags = tags
+				}
+			}
+		}
+	}
+
 	switch modelType {
 	case constant.ChannelTypeAnthropic:
 		useranthropicModels := make([]dto.AnthropicModel, len(userOpenAiModels))

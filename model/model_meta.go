@@ -146,3 +146,24 @@ func SearchModels(keyword string, vendor string, offset int, limit int) ([]*Mode
 	}
 	return models, total, nil
 }
+
+// GetModelTagsMap 批量获取模型的 tags，返回 modelName -> tags 的映射
+func GetModelTagsMap(modelNames []string) (map[string]string, error) {
+	result := make(map[string]string)
+	if len(modelNames) == 0 {
+		return result, nil
+	}
+
+	var models []Model
+	err := DB.Select("model_name, tags").Where("model_name IN ?", modelNames).Find(&models).Error
+	if err != nil {
+		return nil, err
+	}
+
+	for _, m := range models {
+		if m.Tags != "" {
+			result[m.ModelName] = m.Tags
+		}
+	}
+	return result, nil
+}

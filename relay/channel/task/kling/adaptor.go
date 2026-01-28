@@ -12,8 +12,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 
-	"github.com/samber/lo"
-
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/pkg/errors"
@@ -69,6 +67,12 @@ type requestPayload struct {
 	CameraControl  *CameraControl `json:"camera_control,omitempty"`
 	CallbackUrl    string         `json:"callback_url,omitempty"`
 	ExternalTaskId string         `json:"external_task_id,omitempty"`
+	// Lip-sync specific fields
+	VideoUrl        string `json:"video_url,omitempty"`
+	AudioUrl        string `json:"audio_url,omitempty"`
+	SoundStartTime  int    `json:"sound_start_time,omitempty"`
+	SoundEndTime    int    `json:"sound_end_time,omitempty"`
+	SoundInsertTime int    `json:"sound_insert_time,omitempty"`
 }
 
 type responsePayload struct {
@@ -118,7 +122,8 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 
 // BuildRequestURL constructs the upstream URL.
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
-	path := lo.Ternary(info.Action == constant.TaskActionGenerate, "/v1/videos/image2video", "/v1/videos/text2video")
+	// 获取端点路径，支持从渠道配置中自定义
+	path := a.getEndpointPath(info)
 
 	if isNewAPIRelay(info.ApiKey) {
 		return fmt.Sprintf("%s/kling%s", a.baseURL, path), nil
@@ -208,7 +213,16 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy 
 	if !ok {
 		return nil, fmt.Errorf("invalid action")
 	}
-	path := lo.Ternary(action == constant.TaskActionGenerate, "/v1/videos/image2video", "/v1/videos/text2video")
+	// 根据 action 获取对应的端点路径
+	var path string
+	switch action {
+	case constant.TaskActionGenerate:
+		path = "/v1/videos/image2video"
+	case constant.TaskActionLipSync:
+		path = "/v1/videos/lip-sync"
+	default:
+		path = "/v1/videos/text2video"
+	}
 	url := fmt.Sprintf("%s%s/%s", baseUrl, path, taskID)
 	if isNewAPIRelay(key) {
 		url = fmt.Sprintf("%s/kling%s/%s", baseUrl, path, taskID)
@@ -246,6 +260,36 @@ func (a *TaskAdaptor) GetChannelName() string {
 // ============================
 // helpers
 // ============================
+
+// getEndpointPath 获取端点路径，支持从渠道配置中自定义
+func (a *TaskAdaptor) getEndpointPath(info *relaycommon.RelayInfo) string {
+	// 默认端点路径映射
+	defaultPaths := map[string]string{
+		constant.TaskActionGenerate:     "/v1/videos/image2video",
+		constant.TaskActionTextGenerate: "/v1/videos/text2video",
+		constant.TaskActionLipSync:      "/v1/videos/lip-sync",
+	}
+
+	// 如果渠道配置了自定义端点路径，优先使用
+	if info.ChannelMeta != nil {
+		if info.ChannelMeta.ChannelSetting.EndpointPaths != nil {
+			if customPath, ok := info.ChannelMeta.ChannelSetting.EndpointPaths[info.Action]; ok && customPath != "" {
+				return customPath
+			}
+		}
+	}
+
+	// 使用默认路径
+	if path, ok := defaultPaths[info.Action]; ok {
+		return path
+	}
+
+	// 兜底：根据 action 判断
+	if info.Action == constant.TaskActionGenerate {
+		return "/v1/videos/image2video"
+	}
+	return "/v1/videos/text2video"
+}
 
 func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*requestPayload, error) {
 	r := requestPayload{
