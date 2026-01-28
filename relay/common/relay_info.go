@@ -91,9 +91,10 @@ type RelayInfo struct {
 	FirstResponseTime time.Time
 	isFirstResponse   bool
 	//SendLastReasoningResponse bool
-	IsStream               bool
-	IsGeminiBatchEmbedding bool
-	IsPlayground           bool
+	IsStream                 bool
+	IsGeminiBatchEmbedding   bool
+	IsGeminiImageGeneration  bool // Gemini image generation using generateContent endpoint
+	IsPlayground             bool
 	UsePrice               bool
 	RelayMode              int
 	OriginModelName        string

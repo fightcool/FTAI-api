@@ -236,11 +236,35 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 	return tasks
 }
 
+// 任务超时时间（秒）- 10分钟
+const TaskTimeoutSeconds = 600
+
 func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
-	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+
+	// 计算超时时间点（当前时间 - 10分钟）
+	timeoutThreshold := time.Now().Unix() - TaskTimeoutSeconds
+
+	// 先将超时的任务标记为失败
+	DB.Model(&Task{}).
+		Where("progress != ?", "100%").
+		Where("status != ?", TaskStatusFailure).
+		Where("status != ?", TaskStatusSuccess).
+		Where("submit_time > 0").
+		Where("submit_time < ?", timeoutThreshold).
+		Updates(map[string]interface{}{
+			"status":      TaskStatusFailure,
+			"progress":    "100%",
+			"fail_reason": "任务超时（超过10分钟）",
+		})
+
+	// get all tasks progress is not 100% and not timed out
+	err = DB.Where("progress != ?", "100%").
+		Where("status != ?", TaskStatusFailure).
+		Where("status != ?", TaskStatusSuccess).
+		Where("submit_time >= ?", timeoutThreshold). // 只获取未超时的任务
+		Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
