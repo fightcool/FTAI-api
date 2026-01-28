@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
@@ -137,6 +138,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.
 	taskErr = adaptor.ValidateRequestAndSetAction(c, info)
 	if taskErr != nil {
 		return
+	}
+
+	// 应用渠道模型映射
+	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+		return service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
 	}
 
 	modelName := info.OriginModelName
@@ -386,7 +392,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 		if err2 != nil {
 			return
 		}
-		if channelModel.Type != constant.ChannelTypeVertexAi && channelModel.Type != constant.ChannelTypeGemini {
+		if channelModel.Type != constant.ChannelTypeVertexAi && channelModel.Type != constant.ChannelTypeGemini && channelModel.Type != constant.ChannelTypeUnifiedVideo && channelModel.Type != constant.ChannelTypeDoubaoVideo {
 			return
 		}
 		baseURL := constant.ChannelBaseURLs[channelModel.Type]
@@ -418,11 +424,26 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 			if ti.Progress != "" {
 				originTask.Progress = ti.Progress
 			}
-			if ti.Url != "" {
+			// 🔥 保存失败原因（优先级：ti.Reason > ti.Url）
+			if ti.Reason != "" {
+				originTask.FailReason = ti.Reason
+			} else if ti.Url != "" {
 				if strings.HasPrefix(ti.Url, "data:") {
 				} else {
 					originTask.FailReason = ti.Url
 				}
+			}
+			// 🔥 保存视频 URL 到 task.Data（供 video_proxy 使用）
+			if ti.RemoteUrl != "" {
+				var taskData map[string]any
+				if originTask.Data != nil {
+					_ = originTask.GetData(&taskData)
+				}
+				if taskData == nil {
+					taskData = make(map[string]any)
+				}
+				taskData["video_url"] = ti.RemoteUrl
+				_ = originTask.SetData(taskData)
 			}
 			_ = originTask.Update()
 			var raw map[string]any
