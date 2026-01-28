@@ -374,6 +374,7 @@ const EditChannelModal = (props) => {
     proxy: '',
     pass_through_body_enabled: false,
     system_prompt: '',
+    endpoint_paths: {},
   });
   const showApiConfigCard = true; // 控制是否显示 API 配置卡片
   const getInitValues = () => ({ ...originInputs });
@@ -560,6 +561,7 @@ const EditChannelModal = (props) => {
           data.system_prompt = parsedSettings.system_prompt || '';
           data.system_prompt_override =
             parsedSettings.system_prompt_override || false;
+          data.endpoint_paths = parsedSettings.endpoint_paths || {};
         } catch (error) {
           console.error('解析渠道设置失败:', error);
           data.force_format = false;
@@ -568,6 +570,7 @@ const EditChannelModal = (props) => {
           data.pass_through_body_enabled = false;
           data.system_prompt = '';
           data.system_prompt_override = false;
+          data.endpoint_paths = {};
         }
       } else {
         data.force_format = false;
@@ -576,6 +579,7 @@ const EditChannelModal = (props) => {
         data.pass_through_body_enabled = false;
         data.system_prompt = '';
         data.system_prompt_override = false;
+        data.endpoint_paths = {};
       }
 
       if (data.settings) {
@@ -644,6 +648,7 @@ const EditChannelModal = (props) => {
         pass_through_body_enabled: data.pass_through_body_enabled,
         system_prompt: data.system_prompt,
         system_prompt_override: data.system_prompt_override || false,
+        endpoint_paths: data.endpoint_paths || {},
       });
       initialModelsRef.current = (data.models || [])
         .map((model) => (model || '').trim())
@@ -1211,6 +1216,10 @@ const EditChannelModal = (props) => {
       system_prompt: localInputs.system_prompt || '',
       system_prompt_override: localInputs.system_prompt_override || false,
     };
+    // 保存 endpoint_paths 到 setting（单数）字段
+    if (channelSettings.endpoint_paths && Object.keys(channelSettings.endpoint_paths).length > 0) {
+      channelExtraSettings.endpoint_paths = channelSettings.endpoint_paths;
+    }
     localInputs.setting = JSON.stringify(channelExtraSettings);
 
     // 处理 settings 字段（包括企业账户设置和字段透传控制）
@@ -1252,6 +1261,9 @@ const EditChannelModal = (props) => {
       }
     }
 
+    // 注意：endpoint_paths 已保存到 setting（单数）字段，不需要再保存到 settings（复数）字段
+    // 后端从 setting 字段读取 ChannelSettings，包括 endpoint_paths
+
     localInputs.settings = JSON.stringify(settings);
 
     // 清理不需要发送到后端的字段
@@ -1261,6 +1273,7 @@ const EditChannelModal = (props) => {
     delete localInputs.pass_through_body_enabled;
     delete localInputs.system_prompt;
     delete localInputs.system_prompt_override;
+    delete localInputs.endpoint_paths;
     delete localInputs.is_enterprise_account;
     // 顶层的 vertex_key_type 不应发送给后端
     delete localInputs.vertex_key_type;
@@ -3085,6 +3098,34 @@ const EditChannelModal = (props) => {
                         '如果用户请求中包含系统提示词，则使用此设置拼接到用户的系统提示词前面',
                       )}
                     />
+
+                    {/* Endpoint Paths 配置 */}
+                    <div style={{ marginTop: '16px' }}>
+                      <Text strong>{t('自定义端点路径 (Endpoint Paths)')}</Text>
+                      <Text type="tertiary" style={{ display: 'block', marginTop: '4px', marginBottom: '8px' }}>
+                        {t('为不同的任务动作配置自定义端点路径，用于对接第三方服务')}
+                      </Text>
+                      <JSONEditor
+                        value={JSON.stringify(channelSettings.endpoint_paths || {}, null, 2)}
+                        onChange={(value) => {
+                          try {
+                            const parsed = JSON.parse(value);
+                            handleChannelSettingsChange('endpoint_paths', parsed);
+                          } catch (e) {
+                            // 忽略解析错误，等待用户输入完整的 JSON
+                          }
+                        }}
+                        placeholder={JSON.stringify({
+                          "lipSync": "/kling/v1/videos/lip-sync",
+                          "textGenerate": "/v1/videos/text2video",
+                          "generate": "/v1/videos/image2video"
+                        }, null, 2)}
+                        height="150px"
+                      />
+                      <Text type="tertiary" style={{ display: 'block', marginTop: '4px' }}>
+                        {t('示例: {"lipSync": "/kling/v1/videos/lip-sync"}')}
+                      </Text>
+                    </div>
                   </Card>
                 </div>
               </div>

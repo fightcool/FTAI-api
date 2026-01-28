@@ -184,6 +184,11 @@ export const CHANNEL_OPTIONS = [
     color: 'blue',
     label: 'Replicate',
   },
+  {
+    value: 57,
+    color: 'teal',
+    label: '统一视频格式',
+  },
 ];
 
 export const MODEL_TABLE_PAGE_SIZE = 10;
