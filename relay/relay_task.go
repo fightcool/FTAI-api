@@ -443,7 +443,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 					taskData = make(map[string]any)
 				}
 				taskData["video_url"] = ti.RemoteUrl
-				_ = originTask.SetData(taskData)
+				originTask.SetData(taskData)
 			}
 			_ = originTask.Update()
 			var raw map[string]any
