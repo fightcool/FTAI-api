@@ -143,35 +143,49 @@ func VideoProxy(c *gin.Context) {
 		}
 		req.Header.Set("x-goog-api-key", apiKey)
 	case constant.ChannelTypeUnifiedVideo:
-		// 🔥 UnifiedVideo 渠道：直接构造上游视频内容 URL
-		// VectorEngine 格式: {baseURL}/v1/video/content?id={task_id}
-		apiKey := task.PrivateData.Key
-		if apiKey == "" {
-			logger.LogError(c.Request.Context(), fmt.Sprintf("Missing stored API key for UnifiedVideo task %s", taskID))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": gin.H{
-					"message": "API key not stored for task",
-					"type":    "server_error",
-				},
-			})
-			return
+		// 🔥 UnifiedVideo 渠道：优先使用已存储的视频 URL
+		// 上游返回的视频 URL 存储在 task.Data 的 video_url 字段中
+		var taskData struct {
+			VideoURL string `json:"video_url"`
+		}
+		if task.Data != nil {
+			_ = task.GetData(&taskData)
 		}
 
-		// 确保 baseURL 不为空
-		if baseURL == "" {
-			logger.LogError(c.Request.Context(), fmt.Sprintf("UnifiedVideo channel %d has no baseURL configured", channel.Id))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": gin.H{
-					"message": "Channel baseURL not configured",
-					"type":    "server_error",
-				},
-			})
-			return
-		}
+		if taskData.VideoURL != "" {
+			// 直接使用上游返回的视频 URL
+			videoURL = taskData.VideoURL
+			logger.LogInfo(c.Request.Context(), fmt.Sprintf("UnifiedVideo: Using stored video URL: %s", videoURL))
+		} else {
+			// 回退：尝试请求上游获取视频
+			apiKey := task.PrivateData.Key
+			if apiKey == "" {
+				logger.LogError(c.Request.Context(), fmt.Sprintf("Missing stored API key for UnifiedVideo task %s", taskID))
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": gin.H{
+						"message": "API key not stored for task",
+						"type":    "server_error",
+					},
+				})
+				return
+			}
 
-		videoURL = fmt.Sprintf("%s/v1/video/content?id=%s", baseURL, task.TaskID)
-		logger.LogInfo(c.Request.Context(), fmt.Sprintf("UnifiedVideo: Fetching video from: %s", videoURL))
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+			// 确保 baseURL 不为空
+			if baseURL == "" {
+				logger.LogError(c.Request.Context(), fmt.Sprintf("UnifiedVideo channel %d has no baseURL configured", channel.Id))
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": gin.H{
+						"message": "Channel baseURL not configured",
+						"type":    "server_error",
+					},
+				})
+				return
+			}
+
+			videoURL = fmt.Sprintf("%s/v1/video/content?id=%s", baseURL, task.TaskID)
+			logger.LogInfo(c.Request.Context(), fmt.Sprintf("UnifiedVideo: Fetching video from upstream: %s", videoURL))
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
 	case constant.ChannelTypeOpenAI, constant.ChannelTypeSora:
 		videoURL = fmt.Sprintf("%s/v1/videos/%s/content", baseURL, task.TaskID)
 		req.Header.Set("Authorization", "Bearer "+channel.Key)
