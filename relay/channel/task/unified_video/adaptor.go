@@ -55,10 +55,9 @@ type responseTask struct {
 	URL       string `json:"url,omitempty"`
 	VideoURL  string `json:"video_url,omitempty"`
 	OutputURL string `json:"output_url,omitempty"`
-	Error     *struct {
-		Message string `json:"message"`
-		Code    string `json:"code"`
-	} `json:"error,omitempty"`
+	// 🔥 Error 使用 json.RawMessage 兼容字符串和结构体两种格式
+	// 上游可能返回 "error": "message" 或 "error": {"message": "...", "code": "..."}
+	Error json.RawMessage `json:"error,omitempty"`
 	// 🔥 嵌套的 data 字段（某些上游 API 使用嵌套结构）
 	Data *responseTaskData `json:"data,omitempty"`
 }
@@ -411,12 +410,28 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	case "failed", "cancelled", "error", "failure":
 		// 🔥 添加 "failure" 状态处理（上游可能返回 "FAILURE"）
 		taskResult.Status = model.TaskStatusFailure
-		if resTask.Error != nil {
-			taskResult.Reason = resTask.Error.Message
-		} else if effectiveFailReason != "" {
-			// 🔥 优先使用 fail_reason 或 data 内部的错误信息
+		// 🔥 解析 Error 字段（可能是字符串或结构体）
+		if len(resTask.Error) > 0 {
+			// 尝试解析为字符串
+			var errStr string
+			if err := json.Unmarshal(resTask.Error, &errStr); err == nil {
+				taskResult.Reason = errStr
+			} else {
+				// 尝试解析为结构体
+				var errObj struct {
+					Message string `json:"message"`
+					Code    string `json:"code"`
+				}
+				if err := json.Unmarshal(resTask.Error, &errObj); err == nil && errObj.Message != "" {
+					taskResult.Reason = errObj.Message
+				}
+			}
+		}
+		// 如果 Error 字段没有解析出原因，使用其他来源
+		if taskResult.Reason == "" && effectiveFailReason != "" {
 			taskResult.Reason = effectiveFailReason
-		} else {
+		}
+		if taskResult.Reason == "" {
 			taskResult.Reason = "task failed"
 		}
 	default:
