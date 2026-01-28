@@ -36,14 +36,19 @@ type upstreamVideoRequest struct {
 }
 
 // responseTask 上游 API 响应格式
+// 🔥 支持两种格式：
+// 1. 扁平格式：{ "id": "xxx", "status": "completed", ... }
+// 2. 嵌套格式：{ "status": "FAILURE", "data": { "id": "xxx", "status": "failed", ... } }
 type responseTask struct {
-	ID               string `json:"id"`
-	TaskID           string `json:"task_id,omitempty"`
-	Object           string `json:"object,omitempty"`
-	Status           string `json:"status"`
-	StatusUpdateTime int64  `json:"status_update_time,omitempty"`
-	Progress         int    `json:"progress,omitempty"`
-	CreatedAt        int64  `json:"created_at,omitempty"`
+	// 顶层字段（扁平格式或嵌套格式的外层）
+	// 🔥 ID 使用 json.Number 兼容数字和字符串两种格式
+	ID               json.Number `json:"id"`
+	TaskID           string      `json:"task_id,omitempty"`
+	Object           string      `json:"object,omitempty"`
+	Status           string      `json:"status"`
+	StatusUpdateTime int64       `json:"status_update_time,omitempty"`
+	Progress         int         `json:"progress,omitempty"`
+	CreatedAt        int64       `json:"created_at,omitempty"`
 	// 🔥 失败原因字段（上游返回 fail_reason）
 	FailReason string `json:"fail_reason,omitempty"`
 	// 视频 URL 字段（不同上游 API 可能使用不同字段名）
@@ -54,6 +59,28 @@ type responseTask struct {
 		Message string `json:"message"`
 		Code    string `json:"code"`
 	} `json:"error,omitempty"`
+	// 🔥 嵌套的 data 字段（某些上游 API 使用嵌套结构）
+	Data *responseTaskData `json:"data,omitempty"`
+}
+
+// responseTaskData 嵌套的 data 字段结构
+type responseTaskData struct {
+	ID               string `json:"id"`
+	Status           string `json:"status"`
+	StatusUpdateTime int64  `json:"status_update_time,omitempty"`
+	VideoURL         string `json:"video_url,omitempty"`
+	Error            string `json:"error,omitempty"`
+	ErrorMessage     string `json:"error_message,omitempty"`
+	// 🔥 detail 字段包含更详细的错误信息
+	Detail *responseTaskDetail `json:"detail,omitempty"`
+}
+
+// responseTaskDetail 详细信息结构
+type responseTaskDetail struct {
+	Message     string `json:"message,omitempty"`
+	Error       string `json:"error,omitempty"`
+	Code        string `json:"code,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 // ============================
@@ -319,17 +346,53 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		Code: 0,
 	}
 
+	// 🔥 优先使用嵌套 data 字段中的信息（某些上游 API 使用嵌套结构）
+	// 上游返回格式: { "status": "FAILURE", "data": { "id": "xxx", "status": "failed", "video_url": "..." } }
+	effectiveStatus := resTask.Status
+	effectiveID := resTask.ID.String() // 🔥 json.Number 转换为 string
+	effectiveVideoURL := resTask.VideoURL
+	effectiveFailReason := resTask.FailReason
+
+	if resTask.Data != nil {
+		// 如果有嵌套的 data 字段，优先使用 data 内部的状态
+		if resTask.Data.Status != "" {
+			effectiveStatus = resTask.Data.Status
+		}
+		if resTask.Data.ID != "" {
+			effectiveID = resTask.Data.ID
+		}
+		if resTask.Data.VideoURL != "" {
+			effectiveVideoURL = resTask.Data.VideoURL
+		}
+		// 如果 data 内部有错误信息，使用它作为失败原因
+		if resTask.Data.Error != "" {
+			effectiveFailReason = resTask.Data.Error
+		}
+		if resTask.Data.ErrorMessage != "" && effectiveFailReason == "" {
+			effectiveFailReason = resTask.Data.ErrorMessage
+		}
+		// 🔥 如果 detail 字段有更详细的错误信息，追加到失败原因
+		if resTask.Data.Detail != nil {
+			if resTask.Data.Detail.Message != "" && effectiveFailReason == "" {
+				effectiveFailReason = resTask.Data.Detail.Message
+			}
+			if resTask.Data.Detail.Description != "" && effectiveFailReason == "" {
+				effectiveFailReason = resTask.Data.Detail.Description
+			}
+		}
+	}
+
 	// 🔥 从上游响应中提取视频 URL（不同 API 可能使用不同字段名）
-	upstreamVideoURL := resTask.URL
+	upstreamVideoURL := effectiveVideoURL
 	if upstreamVideoURL == "" {
-		upstreamVideoURL = resTask.VideoURL
+		upstreamVideoURL = resTask.URL
 	}
 	if upstreamVideoURL == "" {
 		upstreamVideoURL = resTask.OutputURL
 	}
 
 	// 🔥 统一转换为小写进行状态匹配，解决上游返回大写状态（如 "FAILURE"）的问题
-	statusLower := strings.ToLower(resTask.Status)
+	statusLower := strings.ToLower(effectiveStatus)
 	switch statusLower {
 	case "queued", "pending":
 		taskResult.Status = model.TaskStatusQueued
@@ -338,7 +401,7 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskResult.Status = model.TaskStatusInProgress
 	case "completed", "succeeded", "success":
 		taskResult.Status = model.TaskStatusSuccess
-		taskResult.Url = fmt.Sprintf("%s/v1/videos/%s/content", system_setting.ServerAddress, resTask.ID)
+		taskResult.Url = fmt.Sprintf("%s/v1/videos/%s/content", system_setting.ServerAddress, effectiveID)
 		taskResult.Progress = "100%" // 任务完成时强制设置进度为100%
 		// 🔥 设置 RemoteUrl 为上游实际视频 URL，供 VideoProxy 使用
 		if upstreamVideoURL != "" {
@@ -349,9 +412,9 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskResult.Status = model.TaskStatusFailure
 		if resTask.Error != nil {
 			taskResult.Reason = resTask.Error.Message
-		} else if resTask.FailReason != "" {
-			// 🔥 优先使用 fail_reason 字段
-			taskResult.Reason = resTask.FailReason
+		} else if effectiveFailReason != "" {
+			// 🔥 优先使用 fail_reason 或 data 内部的错误信息
+			taskResult.Reason = effectiveFailReason
 		} else {
 			taskResult.Reason = "task failed"
 		}
