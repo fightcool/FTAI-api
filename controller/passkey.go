@@ -286,7 +286,7 @@ func PasskeyLoginFinish(c *gin.Context) {
 		return passkeysvc.NewWebAuthnUser(user, credential), nil
 	}
 
-	waUser, credential, err := wa.FinishPasskeyLogin(handler, *sessionData, c.Request)
+	waUser, credential, err := wa.FinishDiscoverableLogin(handler, *sessionData, c.Request)
 	if err != nil {
 		common.ApiError(c, err)
 		return

@@ -48,6 +48,11 @@ func (u *WebAuthnUser) WebAuthnDisplayName() string {
 	return u.WebAuthnName()
 }
 
+// WebAuthnIcon 返回用户图标 URL（新版 webauthn 接口要求）
+func (u *WebAuthnUser) WebAuthnIcon() string {
+	return ""
+}
+
 func (u *WebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 	if u == nil || u.credential == nil {
 		return nil
