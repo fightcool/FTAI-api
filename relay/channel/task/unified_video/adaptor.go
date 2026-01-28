@@ -394,10 +394,11 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	// 🔥 统一转换为小写进行状态匹配，解决上游返回大写状态（如 "FAILURE"）的问题
 	statusLower := strings.ToLower(effectiveStatus)
 	switch statusLower {
-	case "queued", "pending":
+	case "queued", "pending", "not_start":
+		// 🔥 添加 not_start 状态（上游可能返回 "NOT_START"）
 		taskResult.Status = model.TaskStatusQueued
-	case "processing", "in_progress", "video_generating", "image_uploading", "image_processing":
-		// 🔥 添加 video_generating 等中间状态的处理
+	case "processing", "in_progress", "video_generating", "image_uploading", "image_processing", "running":
+		// 🔥 添加 video_generating、running 等中间状态的处理
 		taskResult.Status = model.TaskStatusInProgress
 	case "completed", "succeeded", "success":
 		taskResult.Status = model.TaskStatusSuccess
