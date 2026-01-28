@@ -1,7 +1,36 @@
 /**
  * PM2 部署配置文件
  * 用于 FT-API 的生产环境部署
+ *
+ * 环境变量从 .env 文件读取
  */
+
+const fs = require('fs');
+const path = require('path');
+
+// 读取 .env 文件并解析为环境变量对象
+function loadEnvFile(envPath) {
+  const env = {};
+  try {
+    const envFile = fs.readFileSync(envPath, 'utf8');
+    envFile.split('\n').forEach(line => {
+      // 跳过空行和注释
+      line = line.trim();
+      if (!line || line.startsWith('#')) return;
+
+      const [key, ...valueParts] = line.split('=');
+      if (key && valueParts.length > 0) {
+        env[key.trim()] = valueParts.join('=').trim();
+      }
+    });
+  } catch (err) {
+    console.warn(`Warning: Could not read ${envPath}:`, err.message);
+  }
+  return env;
+}
+
+// 加载 .env 文件
+const envFile = loadEnvFile(path.join(__dirname, '.env'));
 
 module.exports = {
   apps: [
@@ -11,14 +40,11 @@ module.exports = {
       script: './new-api',
       // 工作目录
       cwd: '/opt/ft-api',
-      // 环境变量
+      // 环境变量（从 .env 文件加载）
       env: {
+        ...envFile,
         NODE_ENV: 'production',
-        GIN_MODE: 'release',
-        // 数据库配置（从环境变量或 .env 文件读取）
-        SQL_DSN: process.env.SQL_DSN || '',
-        REDIS_CONN_STRING: process.env.REDIS_CONN_STRING || '',
-        SESSION_SECRET: process.env.SESSION_SECRET || '',
+        GIN_MODE: envFile.GIN_MODE || 'release',
       },
       // 实例数量（Go 程序通常单实例即可，内部已有 goroutine 并发）
       instances: 1,
@@ -45,32 +71,5 @@ module.exports = {
       wait_ready: true,
       listen_timeout: 10000,
     }
-  ],
-
-  // 部署配置
-  deploy: {
-    production: {
-      // SSH 用户
-      user: 'root',
-      // 服务器地址（多台服务器用数组）
-      host: ['your-server-ip'],
-      // 部署的分支
-      ref: 'origin/main',
-      // Git 仓库地址
-      repo: 'git@github.com:your-org/ft-api.git',
-      // 服务器上的部署路径
-      path: '/opt/ft-api',
-      // SSH 选项
-      ssh_options: 'StrictHostKeyChecking=no',
-      // 部署前执行的命令（在本地）
-      'pre-deploy-local': '',
-      // 部署后执行的命令（在服务器）
-      'post-deploy': 'cd /opt/ft-api/current && ./deploy.sh',
-      // 环境变量
-      env: {
-        NODE_ENV: 'production',
-        GIN_MODE: 'release'
-      }
-    }
-  }
+  ]
 };
