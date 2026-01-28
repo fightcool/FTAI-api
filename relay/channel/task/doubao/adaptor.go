@@ -384,15 +384,35 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 
 	openAIResp := dto.NewOpenAIVideo()
 	openAIResp.ID = task.TaskID
-	openAIResp.Status = convertDoubaoStatus(doubaoResp.Status)
 	openAIResp.Model = task.Properties.OriginModelName
 	openAIResp.SetProgressStr(task.Progress)
 	openAIResp.CreatedAt = task.CreatedAt
 	openAIResp.CompletedAt = task.UpdatedAt
 
-	// 设置视频URL（核心字段）
-	if doubaoResp.Content.VideoURL != "" {
-		openAIResp.SetMetadata("url", doubaoResp.Content.VideoURL)
+	// 🔥 优先使用 task.Status（由轮询更新），而不是 doubaoResp.Status（原始响应）
+	// task.Status 是由 ParseTaskResult 更新的最新状态
+	switch task.Status {
+	case model.TaskStatusSuccess:
+		openAIResp.Status = dto.VideoStatusCompleted
+	case model.TaskStatusFailure:
+		openAIResp.Status = dto.VideoStatusFailed
+	case model.TaskStatusQueued, model.TaskStatusSubmitted:
+		openAIResp.Status = dto.VideoStatusQueued
+	case model.TaskStatusInProgress:
+		openAIResp.Status = dto.VideoStatusInProgress
+	default:
+		// 回退到原始响应状态
+		openAIResp.Status = convertDoubaoStatus(doubaoResp.Status)
+	}
+
+	// 🔥 优先使用 task.FailReason（由轮询更新的视频URL），而不是 doubaoResp.Content.VideoURL
+	// relay_task.go 会将视频URL存储在 task.FailReason 中
+	videoURL := task.FailReason
+	if videoURL == "" {
+		videoURL = doubaoResp.Content.VideoURL
+	}
+	if videoURL != "" {
+		openAIResp.SetMetadata("url", videoURL)
 	}
 
 	// 设置尾帧URL（如果有）
