@@ -274,19 +274,20 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 		return
 	}
 
-	// 获取任务 ID
-	if dResp.ID == "" && dResp.TaskID != "" {
-		dResp.ID = dResp.TaskID
+	// 获取任务 ID（兼容 json.Number 和 string 两种格式）
+	taskIDStr := dResp.ID.String()
+	if taskIDStr == "" && dResp.TaskID != "" {
+		taskIDStr = dResp.TaskID
 	}
-	if dResp.ID == "" {
+	if taskIDStr == "" {
 		taskErr = service.TaskErrorWrapper(fmt.Errorf("task_id is empty, response: %s", string(responseBody)), "invalid_response", http.StatusInternalServerError)
 		return
 	}
 
 	// 返回 OpenAI 兼容格式
 	openAIResp := dto.NewOpenAIVideo()
-	openAIResp.ID = dResp.ID
-	openAIResp.TaskID = dResp.ID
+	openAIResp.ID = taskIDStr
+	openAIResp.TaskID = taskIDStr
 	openAIResp.Status = dResp.Status
 	openAIResp.Model = info.OriginModelName
 	if dResp.CreatedAt > 0 {
@@ -294,7 +295,7 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	}
 
 	c.JSON(http.StatusOK, openAIResp)
-	return dResp.ID, responseBody, nil
+	return taskIDStr, responseBody, nil
 }
 
 // FetchTask 获取任务状态
