@@ -286,7 +286,7 @@ func PasskeyLoginFinish(c *gin.Context) {
 		return passkeysvc.NewWebAuthnUser(user, credential), nil
 	}
 
-	waUser, credential, err := wa.FinishDiscoverableLogin(handler, *sessionData, c.Request)
+	waUser, err := wa.FinishDiscoverableLogin(handler, *sessionData, c.Request)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -309,15 +309,15 @@ func PasskeyLoginFinish(c *gin.Context) {
 		return
 	}
 
-	// 更新凭证信息
-	updatedCredential := model.NewPasskeyCredentialFromWebAuthn(modelUser.Id, credential)
-	if updatedCredential == nil {
-		common.ApiErrorMsg(c, "Passkey 凭证更新失败")
+	// 更新凭证信息（从 userWrapper 获取 credential）
+	credential := userWrapper.PasskeyCredential()
+	if credential == nil {
+		common.ApiErrorMsg(c, "Passkey 凭证获取失败")
 		return
 	}
 	now := time.Now()
-	updatedCredential.LastUsedAt = &now
-	if err := model.UpsertPasskeyCredential(updatedCredential); err != nil {
+	credential.LastUsedAt = &now
+	if err := model.UpsertPasskeyCredential(credential); err != nil {
 		common.ApiError(c, err)
 		return
 	}
