@@ -44,6 +44,8 @@ type responseTask struct {
 	StatusUpdateTime int64  `json:"status_update_time,omitempty"`
 	Progress         int    `json:"progress,omitempty"`
 	CreatedAt        int64  `json:"created_at,omitempty"`
+	// 🔥 失败原因字段（上游返回 fail_reason）
+	FailReason string `json:"fail_reason,omitempty"`
 	// 视频 URL 字段（不同上游 API 可能使用不同字段名）
 	URL       string `json:"url,omitempty"`
 	VideoURL  string `json:"video_url,omitempty"`
@@ -326,7 +328,9 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		upstreamVideoURL = resTask.OutputURL
 	}
 
-	switch resTask.Status {
+	// 🔥 统一转换为小写进行状态匹配，解决上游返回大写状态（如 "FAILURE"）的问题
+	statusLower := strings.ToLower(resTask.Status)
+	switch statusLower {
 	case "queued", "pending":
 		taskResult.Status = model.TaskStatusQueued
 	case "processing", "in_progress", "video_generating", "image_uploading", "image_processing":
@@ -340,10 +344,14 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		if upstreamVideoURL != "" {
 			taskResult.RemoteUrl = upstreamVideoURL
 		}
-	case "failed", "cancelled", "error":
+	case "failed", "cancelled", "error", "failure":
+		// 🔥 添加 "failure" 状态处理（上游可能返回 "FAILURE"）
 		taskResult.Status = model.TaskStatusFailure
 		if resTask.Error != nil {
 			taskResult.Reason = resTask.Error.Message
+		} else if resTask.FailReason != "" {
+			// 🔥 优先使用 fail_reason 字段
+			taskResult.Reason = resTask.FailReason
 		} else {
 			taskResult.Reason = "task failed"
 		}
