@@ -363,7 +363,20 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	// 🔥 优先使用嵌套 data 字段中的信息（某些上游 API 使用嵌套结构）
 	// 上游返回格式: { "status": "FAILURE", "data": { "id": "xxx", "status": "failed", "video_url": "..." } }
 	effectiveStatus := resTask.Status
-	effectiveID := resTask.ID.String() // 🔥 json.Number 转换为 string
+	// 🔥 ID 兼容 数字、json.Number、string 等多种格式
+	effectiveID := ""
+	switch v := resTask.ID.(type) {
+	case string:
+		effectiveID = v
+	case float64:
+		effectiveID = fmt.Sprintf("%.0f", v)
+	case json.Number:
+		effectiveID = v.String()
+	case nil:
+		// ID 为空
+	default:
+		effectiveID = fmt.Sprintf("%v", v)
+	}
 	effectiveVideoURL := resTask.VideoURL
 	effectiveFailReason := resTask.FailReason
 
