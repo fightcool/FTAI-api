@@ -137,6 +137,20 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err != nil {
 		return nil, errors.Wrap(err, "get_request_body_failed")
 	}
+
+	// 如果模型被映射了，需要修改请求体中的model字段
+	if info.IsModelMapped {
+		var requestMap map[string]interface{}
+		if err := common.Unmarshal(cachedBody, &requestMap); err == nil {
+			// 更新model字段为映射后的模型名
+			requestMap["model"] = info.UpstreamModelName
+			// 重新序列化
+			if modifiedBody, err := common.Marshal(requestMap); err == nil {
+				return bytes.NewReader(modifiedBody), nil
+			}
+		}
+	}
+
 	return bytes.NewReader(cachedBody), nil
 }
 

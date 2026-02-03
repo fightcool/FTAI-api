@@ -139,21 +139,49 @@ func RedisHSetObj(key string, obj interface{}, expiration time.Duration) error {
 			continue
 		}
 
-		// 其他类型直接转换为字符串
-		data[field.Name] = fmt.Sprintf("%v", value.Interface())
+		// 处理不可序列化的类型（func, chan, unsafe.Pointer等）
+		kind := value.Kind()
+		if kind == reflect.Func || kind == reflect.Chan || kind == reflect.UnsafePointer {
+			if DebugEnabled {
+				SysLog(fmt.Sprintf("Redis HSET: skipping unsupported field %s of kind %v", field.Name, kind))
+			}
+			continue
+		}
+
+		// 其他类型转换为字符串，捕获panic
+		var strValue string
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					strValue = ""
+					if DebugEnabled {
+						SysLog(fmt.Sprintf("Redis HSET: failed to serialize field %s: %v", field.Name, r))
+					}
+				}
+			}()
+			strValue = fmt.Sprintf("%v", value.Interface())
+			// 检查是否为"<nil>"字符串
+			if strValue == "<nil>" {
+				strValue = ""
+			}
+		}()
+		data[field.Name] = strValue
 	}
 
-	txn := RDB.TxPipeline()
-	txn.HSet(ctx, key, data)
+	// 使用普通的命令而不是事务，减少事务失败的风险
+	pipe := RDB.Pipeline()
+	pipe.HSet(ctx, key, data)
 
 	// 只有在 expiration 大于 0 时才设置过期时间
 	if expiration > 0 {
-		txn.Expire(ctx, key, expiration)
+		pipe.Expire(ctx, key, expiration)
 	}
 
-	_, err := txn.Exec(ctx)
+	_, err := pipe.Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to execute transaction: %w", err)
+		// 添加更详细的错误日志
+		SysLog(fmt.Sprintf("Redis HSET failed: key=%s, error=%v, data_size=%d", key, err, len(data)))
+		return fmt.Errorf("failed to execute pipeline: %w", err)
 	}
 	return nil
 }

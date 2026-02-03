@@ -3,8 +3,10 @@ package model
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"fmt"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
@@ -246,18 +248,23 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	// 计算超时时间点（当前时间 - 10分钟）
 	timeoutThreshold := time.Now().Unix() - TaskTimeoutSeconds
 
-	// 先将超时的任务标记为失败
-	DB.Model(&Task{}).
+	// 先将超时的任务标记为失败，并记录影响的行数
+	result := DB.Model(&Task{}).
 		Where("progress != ?", "100%").
-		Where("status != ?", TaskStatusFailure).
-		Where("status != ?", TaskStatusSuccess).
-		Where("submit_time > 0").
-		Where("submit_time < ?", timeoutThreshold).
+		Where("status NOT IN (?)", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Where("submit_time > 0 AND submit_time < ?", timeoutThreshold).
 		Updates(map[string]interface{}{
 			"status":      TaskStatusFailure,
 			"progress":    "100%",
 			"fail_reason": "任务超时（超过10分钟）",
 		})
+
+	// 记录超时任务数量
+	if result.Error != nil {
+		common.SysError(fmt.Sprintf("Failed to mark timeout tasks: %v", result.Error))
+	} else if result.RowsAffected > 0 {
+		common.SysLog(fmt.Sprintf("Marked %d tasks as timeout", result.RowsAffected))
+	}
 
 	// get all tasks progress is not 100% and not timed out
 	err = DB.Where("progress != ?", "100%").

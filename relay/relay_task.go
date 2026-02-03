@@ -208,7 +208,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.
 	common.SysError(fmt.Sprintf("VIDEO DEBUG: Response status code: %d", resp.StatusCode))
 	if resp != nil && resp.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(resp.Body)
-		common.SysLog(fmt.Sprintf("Gemini API error (status %d): %s", resp.StatusCode, string(responseBody)))
+		channelName := adaptor.GetChannelName()
+		common.SysLog(fmt.Sprintf("%s API error (status %d): %s", channelName, resp.StatusCode, string(responseBody)))
 		common.SysError(fmt.Sprintf("VIDEO API ERROR (status %d): %s", resp.StatusCode, string(responseBody)))
 		taskErr = service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
 		return
