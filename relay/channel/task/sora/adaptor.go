@@ -138,13 +138,44 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		return nil, errors.Wrap(err, "get_request_body_failed")
 	}
 
-	// 如果模型被映射了，需要修改请求体中的model字段
-	if info.IsModelMapped {
-		var requestMap map[string]interface{}
-		if err := common.Unmarshal(cachedBody, &requestMap); err == nil {
-			// 更新model字段为映射后的模型名
+	// 解析请求体以进行必要的转换
+	var requestMap map[string]interface{}
+	needsModification := false
+
+	if err := common.Unmarshal(cachedBody, &requestMap); err == nil {
+		// 1. 如果模型被映射了，更新model字段
+		if info.IsModelMapped {
 			requestMap["model"] = info.UpstreamModelName
-			// 重新序列化
+			needsModification = true
+		}
+
+		// 2. 转换size参数（large/medium/small → 具体分辨率）
+		if size, ok := requestMap["size"].(string); ok {
+			var newSize string
+			switch size {
+			case "large":
+				// 横屏用1280x720，竖屏用720x1280
+				if orientation, _ := requestMap["orientation"].(string); orientation == "portrait" {
+					newSize = "720x1280"
+				} else {
+					newSize = "1280x720" // 默认横屏
+				}
+			case "medium", "small":
+				// 中小尺寸也用标清
+				if orientation, _ := requestMap["orientation"].(string); orientation == "portrait" {
+					newSize = "720x1280"
+				} else {
+					newSize = "1280x720"
+				}
+			}
+			if newSize != "" {
+				requestMap["size"] = newSize
+				needsModification = true
+			}
+		}
+
+		// 3. 如果有修改，重新序列化
+		if needsModification {
 			if modifiedBody, err := common.Marshal(requestMap); err == nil {
 				return bytes.NewReader(modifiedBody), nil
 			}
