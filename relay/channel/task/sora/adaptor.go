@@ -101,9 +101,10 @@ func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, erro
 // getEndpointPath 获取端点路径，支持从渠道配置中自定义
 func (a *TaskAdaptor) getEndpointPath(info *relaycommon.RelayInfo) string {
 	// 默认端点路径映射
+	// ToAPIs 使用 /v1/videos/generations 路径
 	defaultPaths := map[string]string{
-		constant.TaskActionGenerate:     "/v1/videos",
-		constant.TaskActionTextGenerate: "/v1/videos",
+		constant.TaskActionGenerate:     "/v1/videos/generations",
+		constant.TaskActionTextGenerate: "/v1/videos/generations",
 	}
 
 	// 如果渠道配置了自定义端点路径，优先使用
@@ -121,8 +122,8 @@ func (a *TaskAdaptor) getEndpointPath(info *relaycommon.RelayInfo) string {
 		return path
 	}
 
-	// 兜底：默认使用 /v1/videos
-	return "/v1/videos"
+	// 兜底：默认使用 /v1/videos/generations
+	return "/v1/videos/generations"
 }
 
 // BuildRequestHeader sets required headers.
