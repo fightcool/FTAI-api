@@ -119,8 +119,12 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 
 // ValidateRequestAndSetAction parses body, validates fields and sets default action.
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
-	// Use the standard validation method for TaskSubmitReq
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate)
+	// 如果中间件已经设置了 action（如对口型中间件），优先使用；否则使用默认的 generate
+	action := constant.TaskActionGenerate
+	if presetAction := c.GetString("action"); presetAction != "" {
+		action = presetAction
+	}
+	return relaycommon.ValidateBasicTaskRequest(c, info, action)
 }
 
 // BuildRequestURL constructs the upstream URL.
