@@ -475,16 +475,49 @@ func (a *TaskAdaptor) createJWTTokenWithKey(apiKey string) (string, error) {
 
 func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
 	taskInfo := &relaycommon.TaskInfo{}
-	resPayload := responsePayload{}
-	err := json.Unmarshal(respBody, &resPayload)
-	if err != nil {
+
+	// 先解析顶层字段，data 用 RawMessage 延迟解析（兼容对象和数组两种格式）
+	var raw struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &raw); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal response body")
 	}
-	taskInfo.Code = resPayload.Code
-	taskInfo.TaskID = resPayload.Data.TaskId
-	taskInfo.Reason = resPayload.Message
+	taskInfo.Code = raw.Code
+	taskInfo.Reason = raw.Message
+
+	// data 内部结构
+	type taskData struct {
+		TaskId        string `json:"task_id"`
+		TaskStatus    string `json:"task_status"`
+		TaskStatusMsg string `json:"task_status_msg"`
+		TaskResult    struct {
+			Videos []struct {
+				Id       string `json:"id"`
+				Url      string `json:"url"`
+				Duration string `json:"duration"`
+			} `json:"videos"`
+		} `json:"task_result"`
+		CreatedAt int64 `json:"created_at"`
+		UpdatedAt int64 `json:"updated_at"`
+	}
+
+	var td taskData
+	// 尝试解析为对象格式 {"data": {...}}
+	if err := json.Unmarshal(raw.Data, &td); err != nil || td.TaskStatus == "" {
+		// 尝试解析为数组格式 {"data": [{...}]}（Kling lip-sync 等接口）
+		var arr []taskData
+		if err2 := json.Unmarshal(raw.Data, &arr); err2 == nil && len(arr) > 0 {
+			td = arr[0]
+		}
+	}
+
+	taskInfo.TaskID = td.TaskId
+
 	//任务状态，枚举值：submitted（已提交）、processing（处理中）、succeed（成功）、failed（失败）
-	status := resPayload.Data.TaskStatus
+	status := td.TaskStatus
 	switch status {
 	case "submitted":
 		taskInfo.Status = model.TaskStatusSubmitted
@@ -497,9 +530,8 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	default:
 		return nil, fmt.Errorf("unknown task status: %s", status)
 	}
-	if videos := resPayload.Data.TaskResult.Videos; len(videos) > 0 {
-		video := videos[0]
-		taskInfo.Url = video.Url
+	if videos := td.TaskResult.Videos; len(videos) > 0 {
+		taskInfo.Url = videos[0].Url
 	}
 	return taskInfo, nil
 }
