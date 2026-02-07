@@ -7,7 +7,7 @@ upload
 build
 *.db-journal
 logs
-web/dist
+## web/dist 已提交到仓库（Go embed 需要）
 .env
 one-api
 new-api

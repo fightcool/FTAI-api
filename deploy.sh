@@ -94,15 +94,8 @@ build_project() {
     log_info "开始编译项目..."
     cd "$APP_DIR"
 
-    # 构建前端（React + Vite）
-    if [ -d "web" ] && [ -f "web/package.json" ]; then
-        log_info "构建前端..."
-        cd web
-        npm install --production=false 2>/dev/null || npm install
-        npm run build
-        cd "$APP_DIR"
-        log_info "前端构建完成"
-    fi
+    # 前端构建产物 web/dist 已提交到仓库，无需在服务器编译
+    # 如需更新前端，请在本地执行: cd web && npm run build，然后提交 web/dist
 
     # 下载依赖
     go mod download
