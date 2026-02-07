@@ -306,5 +306,40 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
-	return task.Data, nil
+	// 从数据库任务记录构造包含最新状态和视频 URL 的响应
+	status := "processing"
+	switch task.Status {
+	case model.TaskStatusSuccess:
+		status = "completed"
+	case model.TaskStatusFailure:
+		status = "failed"
+	case model.TaskStatusQueued:
+		status = "queued"
+	case model.TaskStatusInProgress:
+		status = "processing"
+	}
+
+	resp := map[string]any{
+		"id":       task.TaskID,
+		"object":   "generation.task",
+		"status":   status,
+		"progress": 100,
+	}
+
+	// FailReason 在任务成功时存储的是视频 URL
+	if task.Status == model.TaskStatusSuccess && task.FailReason != "" {
+		resp["result"] = map[string]any{
+			"type": "video",
+			"data": []map[string]any{
+				{"url": task.FailReason, "format": "mp4"},
+			},
+		}
+		resp["url"] = task.FailReason
+	} else if task.Status == model.TaskStatusFailure {
+		resp["error"] = map[string]any{
+			"message": task.FailReason,
+		}
+	}
+
+	return common.Marshal(resp)
 }
