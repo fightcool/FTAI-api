@@ -405,10 +405,19 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 		if adaptor == nil {
 			return
 		}
-		resp, err2 := adaptor.FetchTask(baseURL, channelModel.Key, map[string]any{
+
+		fetchBody := map[string]any{
 			"task_id": originTask.TaskID,
 			"action":  originTask.Action,
-		}, proxy)
+		}
+		// 从渠道端点配置中读取自定义查询路径
+		if eps := channelModel.GetSetting().EndpointPaths; eps != nil {
+			if fp, ok := eps["fetch"]; ok && fp != "" {
+				fetchBody["fetch_path"] = fp
+			}
+		}
+
+		resp, err2 := adaptor.FetchTask(baseURL, channelModel.Key, fetchBody, proxy)
 		if err2 != nil || resp == nil {
 			return
 		}

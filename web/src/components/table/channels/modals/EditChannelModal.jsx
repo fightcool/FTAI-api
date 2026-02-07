@@ -3105,6 +3105,41 @@ const EditChannelModal = (props) => {
                       <Text type="tertiary" style={{ display: 'block', marginTop: '4px', marginBottom: '8px' }}>
                         {t('为不同的任务动作配置自定义端点路径，用于对接第三方服务')}
                       </Text>
+
+                      {/* 当前生效配置 */}
+                      {channelSettings.endpoint_paths && Object.keys(channelSettings.endpoint_paths).length > 0 ? (
+                        <div style={{
+                          padding: '8px 12px',
+                          backgroundColor: '#f0f9eb',
+                          borderRadius: '4px',
+                          marginBottom: '12px',
+                          border: '1px solid #b7eb8f'
+                        }}>
+                          <Text strong style={{ fontSize: '12px', color: '#52c41a' }}>
+                            ✅ {t('当前生效配置：')}
+                          </Text>
+                          {Object.entries(channelSettings.endpoint_paths).map(([key, value]) => (
+                            <div key={key} style={{ fontSize: '12px', color: '#333', marginTop: '2px' }}>
+                              <code style={{ backgroundColor: '#e6f7ff', padding: '1px 4px', borderRadius: '2px' }}>{key}</code>
+                              {' → '}
+                              <code style={{ backgroundColor: '#f5f5f5', padding: '1px 4px', borderRadius: '2px' }}>{value}</code>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div style={{
+                          padding: '8px 12px',
+                          backgroundColor: '#fffbe6',
+                          borderRadius: '4px',
+                          marginBottom: '12px',
+                          border: '1px solid #ffe58f'
+                        }}>
+                          <Text style={{ fontSize: '12px', color: '#ad8b00' }}>
+                            ⚙️ {t('未配置自定义端点，将使用各适配器的默认端点路径')}
+                          </Text>
+                        </div>
+                      )}
+
                       <JSONEditor
                         value={JSON.stringify(channelSettings.endpoint_paths || {}, null, 2)}
                         onChange={(value) => {
@@ -3116,15 +3151,36 @@ const EditChannelModal = (props) => {
                           }
                         }}
                         placeholder={JSON.stringify({
-                          "lipSync": "/kling/v1/videos/lip-sync",
-                          "textGenerate": "/v1/videos/text2video",
-                          "generate": "/v1/videos/image2video"
+                          "generate": "/v1/videos/generations",
+                          "fetch": "/v1/videos/generations"
                         }, null, 2)}
                         height="150px"
                       />
-                      <Text type="tertiary" style={{ display: 'block', marginTop: '4px' }}>
-                        {t('示例: {"lipSync": "/kling/v1/videos/lip-sync"}')}
-                      </Text>
+
+                      {/* 支持的键说明 */}
+                      <div style={{
+                        padding: '10px 12px',
+                        backgroundColor: '#f6f8fa',
+                        borderRadius: '4px',
+                        marginTop: '8px',
+                        border: '1px solid #e1e4e8'
+                      }}>
+                        <Text strong style={{ fontSize: '12px', color: '#0366d6', display: 'block', marginBottom: '6px' }}>
+                          {t('支持的端点键 (key)：')}
+                        </Text>
+                        <div style={{ fontSize: '12px', color: '#586069', lineHeight: '1.8' }}>
+                          <div><code>generate</code> — {t('视频生成（图生视频/文生视频）')}</div>
+                          <div><code>textGenerate</code> — {t('纯文本生成视频')}</div>
+                          <div><code>fetch</code> — {t('任务状态查询')}</div>
+                          <div><code>firstTailGenerate</code> — {t('首尾帧生成')}</div>
+                          <div><code>referenceGenerate</code> — {t('参考图生成')}</div>
+                          <div><code>remixGenerate</code> — {t('混音/重混生成')}</div>
+                          <div><code>lipSync</code> — {t('唇形同步')}</div>
+                        </div>
+                        <Text type="tertiary" style={{ display: 'block', fontSize: '11px', marginTop: '8px', lineHeight: '1.6' }}>
+                          {t('示例：')} <code>{`{"generate": "/v1/videos/generations", "fetch": "/v1/videos/generations"}`}</code>
+                        </Text>
+                      </div>
                     </div>
                   </Card>
                 </div>

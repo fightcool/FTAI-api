@@ -47,7 +47,15 @@ type responseTask struct {
 	Seconds            string `json:"seconds,omitempty"`
 	Size               string `json:"size,omitempty"`
 	RemixedFromVideoID string `json:"remixed_from_video_id,omitempty"`
-	Error              *struct {
+	// ToAPIs 返回的视频结果
+	Result *struct {
+		Type string `json:"type"`
+		Data []struct {
+			URL    string `json:"url"`
+			Format string `json:"format"`
+		} `json:"data"`
+	} `json:"result,omitempty"`
+	Error *struct {
 		Message string `json:"message"`
 		Code    string `json:"code"`
 	} `json:"error,omitempty"`
@@ -227,7 +235,13 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy 
 		return nil, fmt.Errorf("invalid task_id")
 	}
 
-	uri := fmt.Sprintf("%s/v1/videos/%s", baseUrl, taskID)
+	// 默认查询端点：/v1/videos/generations/{task_id}（ToAPIs 格式）
+	uri := fmt.Sprintf("%s/v1/videos/generations/%s", baseUrl, taskID)
+
+	// 如果有自定义的查询端点路径，使用自定义路径
+	if fetchPath, ok := body["fetch_path"].(string); ok && fetchPath != "" {
+		uri = fmt.Sprintf("%s%s/%s", baseUrl, fetchPath, taskID)
+	}
 
 	req, err := http.NewRequest(http.MethodGet, uri, nil)
 	if err != nil {
@@ -268,7 +282,13 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskResult.Status = model.TaskStatusInProgress
 	case "completed":
 		taskResult.Status = model.TaskStatusSuccess
-		taskResult.Url = fmt.Sprintf("%s/v1/videos/%s/content", system_setting.ServerAddress, resTask.ID)
+		// ToAPIs 返回的视频 URL 在 result.data[0].url
+		if resTask.Result != nil && len(resTask.Result.Data) > 0 && resTask.Result.Data[0].URL != "" {
+			taskResult.Url = resTask.Result.Data[0].URL
+		} else {
+			// 兜底：使用 FT-API 的 /content 端点
+			taskResult.Url = fmt.Sprintf("%s/v1/videos/%s/content", system_setting.ServerAddress, resTask.ID)
+		}
 	case "failed", "cancelled":
 		taskResult.Status = model.TaskStatusFailure
 		if resTask.Error != nil {

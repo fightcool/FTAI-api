@@ -74,10 +74,19 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
-	resp, err := adaptor.FetchTask(baseURL, channel.Key, map[string]any{
+
+	fetchBody := map[string]any{
 		"task_id": taskId,
 		"action":  task.Action,
-	}, proxy)
+	}
+	// 从渠道端点配置中读取自定义查询路径
+	if eps := channel.GetSetting().EndpointPaths; eps != nil {
+		if fp, ok := eps["fetch"]; ok && fp != "" {
+			fetchBody["fetch_path"] = fp
+		}
+	}
+
+	resp, err := adaptor.FetchTask(baseURL, channel.Key, fetchBody, proxy)
 	if err != nil {
 		return fmt.Errorf("fetchTask failed for task %s: %w", taskId, err)
 	}
