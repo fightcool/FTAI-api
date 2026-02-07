@@ -488,6 +488,14 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	taskInfo.Code = raw.Code
 	taskInfo.Reason = raw.Message
 
+	// 如果上游返回错误码且 data 为空/null，直接视为失败
+	dataStr := string(raw.Data)
+	if raw.Code != 0 && (dataStr == "" || dataStr == "null" || dataStr == "{}") {
+		taskInfo.Status = model.TaskStatusFailure
+		taskInfo.Reason = raw.Message
+		return taskInfo, nil
+	}
+
 	// data 内部结构
 	type taskData struct {
 		TaskId        string `json:"task_id"`
@@ -516,6 +524,11 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 
 	taskInfo.TaskID = td.TaskId
 
+	// 如果 task_status_msg 有值，用它作为失败原因（比顶层 message 更具体）
+	if td.TaskStatusMsg != "" {
+		taskInfo.Reason = td.TaskStatusMsg
+	}
+
 	//任务状态，枚举值：submitted（已提交）、processing（处理中）、succeed（成功）、failed（失败）
 	status := td.TaskStatus
 	switch status {
@@ -528,7 +541,12 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	case "failed":
 		taskInfo.Status = model.TaskStatusFailure
 	default:
-		return nil, fmt.Errorf("unknown task status: %s", status)
+		// 如果 code != 0 但 data 中没有 task_status，视为失败
+		if raw.Code != 0 {
+			taskInfo.Status = model.TaskStatusFailure
+			return taskInfo, nil
+		}
+		return nil, fmt.Errorf("unknown task status: %s (raw response: %s)", status, string(respBody)[:min(len(respBody), 500)])
 	}
 	if videos := td.TaskResult.Videos; len(videos) > 0 {
 		taskInfo.Url = videos[0].Url
