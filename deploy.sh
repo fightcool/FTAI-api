@@ -89,10 +89,20 @@ pull_code() {
     git log -1 --oneline
 }
 
-# 编译项目
+# 编译项目（含前端构建）
 build_project() {
     log_info "开始编译项目..."
     cd "$APP_DIR"
+
+    # 构建前端（React + Vite）
+    if [ -d "web" ] && [ -f "web/package.json" ]; then
+        log_info "构建前端..."
+        cd web
+        npm install --production=false 2>/dev/null || npm install
+        npm run build
+        cd "$APP_DIR"
+        log_info "前端构建完成"
+    fi
 
     # 下载依赖
     go mod download

@@ -3103,7 +3103,7 @@ const EditChannelModal = (props) => {
                     <div style={{ marginTop: '16px' }}>
                       <Text strong>{t('自定义端点路径 (Endpoint Paths)')}</Text>
                       <Text type="tertiary" style={{ display: 'block', marginTop: '4px', marginBottom: '8px' }}>
-                        {t('为不同的任务动作配置自定义端点路径，用于对接第三方服务')}
+                        {t('覆盖各任务动作的默认上游端点路径。留空则使用适配器内置的默认路径。')}
                       </Text>
 
                       {/* 当前生效配置 */}
@@ -3151,13 +3151,13 @@ const EditChannelModal = (props) => {
                           }
                         }}
                         placeholder={JSON.stringify({
-                          "generate": "/v1/videos/generations",
-                          "fetch": "/v1/videos/generations"
+                          "lipSync": "/v1/videos/advanced-lip-sync",
+                          "identifyFace": "/v1/videos/identify-face"
                         }, null, 2)}
                         height="150px"
                       />
 
-                      {/* 支持的键说明 */}
+                      {/* 支持的键说明 + 默认路径 */}
                       <div style={{
                         padding: '10px 12px',
                         backgroundColor: '#f6f8fa',
@@ -3166,19 +3166,19 @@ const EditChannelModal = (props) => {
                         border: '1px solid #e1e4e8'
                       }}>
                         <Text strong style={{ fontSize: '12px', color: '#0366d6', display: 'block', marginBottom: '6px' }}>
-                          {t('支持的端点键 (key)：')}
+                          {t('可配置的端点键及 Kling 默认路径：')}
                         </Text>
-                        <div style={{ fontSize: '12px', color: '#586069', lineHeight: '1.8' }}>
-                          <div><code>generate</code> — {t('视频生成（图生视频/文生视频）')}</div>
-                          <div><code>textGenerate</code> — {t('纯文本生成视频')}</div>
-                          <div><code>fetch</code> — {t('任务状态查询')}</div>
+                        <div style={{ fontSize: '12px', color: '#586069', lineHeight: '2' }}>
+                          <div><code>generate</code> — {t('图生视频')} <Text type="tertiary" size="small">({t('默认')}: /v1/videos/image2video)</Text></div>
+                          <div><code>textGenerate</code> — {t('文生视频')} <Text type="tertiary" size="small">({t('默认')}: /v1/videos/text2video)</Text></div>
+                          <div><code>lipSync</code> — {t('对口型生成')} <Text type="tertiary" size="small">({t('默认')}: /v1/videos/advanced-lip-sync)</Text></div>
+                          <div><code>identifyFace</code> — {t('人脸识别')} <Text type="tertiary" size="small">({t('默认')}: /v1/videos/identify-face)</Text></div>
                           <div><code>firstTailGenerate</code> — {t('首尾帧生成')}</div>
                           <div><code>referenceGenerate</code> — {t('参考图生成')}</div>
                           <div><code>remixGenerate</code> — {t('混音/重混生成')}</div>
-                          <div><code>lipSync</code> — {t('唇形同步')}</div>
                         </div>
                         <Text type="tertiary" style={{ display: 'block', fontSize: '11px', marginTop: '8px', lineHeight: '1.6' }}>
-                          {t('示例：')} <code>{`{"generate": "/v1/videos/generations", "fetch": "/v1/videos/generations"}`}</code>
+                          {t('示例：')} <code>{`{"lipSync": "/v1/videos/advanced-lip-sync", "identifyFace": "/v1/videos/identify-face"}`}</code>
                         </Text>
                       </div>
                     </div>
