@@ -220,13 +220,18 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 		taskErr = service.TaskErrorWrapperLocal(fmt.Errorf("%s", kResp.Message), "task_failed", http.StatusBadRequest)
 		return
 	}
+	// 提取 task_id：优先从 Data.TaskId 获取，回退到顶层 TaskId（identify-face 等接口）
+	taskId := kResp.Data.TaskId
+	if taskId == "" {
+		taskId = kResp.TaskId
+	}
 	ov := dto.NewOpenAIVideo()
-	ov.ID = kResp.Data.TaskId
-	ov.TaskID = kResp.Data.TaskId
+	ov.ID = taskId
+	ov.TaskID = taskId
 	ov.CreatedAt = time.Now().Unix()
 	ov.Model = info.OriginModelName
 	c.JSON(http.StatusOK, ov)
-	return kResp.Data.TaskId, responseBody, nil
+	return taskId, responseBody, nil
 }
 
 // FetchTask fetch task status
