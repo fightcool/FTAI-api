@@ -8,10 +8,15 @@ var ModelList = []string{
 	"Doubao-lite-32k",
 	"Doubao-lite-4k",
 	"Doubao-embedding",
+	// 图像生成模型 (官方格式: doubao-seedream-X.X)
+	"doubao-seedream-4.5",
+	"doubao-seedream-4.0",
 	"doubao-seedream-4-0-250828",
 	"seedream-4-0-250828",
+	// 视频生成模型
 	"doubao-seedance-1-0-pro-250528",
 	"seedance-1-0-pro-250528",
+	// 思考模型
 	"doubao-seed-1-6-thinking-250715",
 	"seed-1-6-thinking-250715",
 }

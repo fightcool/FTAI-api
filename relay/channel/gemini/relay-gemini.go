@@ -1456,7 +1456,7 @@ func GeminiChatImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 	service.CloseResponseBodyGracefully(resp)
 
 	if common.DebugEnabled {
-		logger.LogDebug(c, fmt.Sprintf("Gemini image generation response: %s", string(responseBody)))
+		logger.LogDebug(c, fmt.Sprintf("Gemini image generation response received: %d bytes", len(responseBody)))
 	}
 
 	var geminiResponse dto.GeminiChatResponse

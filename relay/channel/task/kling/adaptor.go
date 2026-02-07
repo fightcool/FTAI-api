@@ -67,12 +67,15 @@ type requestPayload struct {
 	CameraControl  *CameraControl `json:"camera_control,omitempty"`
 	CallbackUrl    string         `json:"callback_url,omitempty"`
 	ExternalTaskId string         `json:"external_task_id,omitempty"`
-	// Lip-sync specific fields
+	// Lip-sync specific fields (legacy format)
 	VideoUrl        string `json:"video_url,omitempty"`
 	AudioUrl        string `json:"audio_url,omitempty"`
 	SoundStartTime  int    `json:"sound_start_time,omitempty"`
 	SoundEndTime    int    `json:"sound_end_time,omitempty"`
 	SoundInsertTime int    `json:"sound_insert_time,omitempty"`
+	// Lip-sync Kling native format (advanced-lip-sync)
+	SessionId  string        `json:"session_id,omitempty"`
+	FaceChoose []interface{} `json:"face_choose,omitempty"`
 }
 
 type responsePayload struct {
@@ -154,12 +157,31 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	}
 	req := v.(relaycommon.TaskSubmitReq)
 
+	// 对口型/人脸识别：将统一扁平格式转换为 Kling 原生格式
+	if action := c.GetString("action"); action == constant.TaskActionLipSync || action == constant.TaskActionIdentifyFace {
+		if req.Metadata != nil {
+			body, err := a.convertLipSyncToKlingFormat(action, req.Metadata)
+			if err != nil {
+				return nil, err
+			}
+			data, err := json.Marshal(body)
+			if err != nil {
+				return nil, err
+			}
+			return bytes.NewReader(data), nil
+		}
+	}
+
 	body, err := a.convertToRequestPayload(&req)
 	if err != nil {
 		return nil, err
 	}
 	if body.Image == "" && body.ImageTail == "" {
 		c.Set("action", constant.TaskActionTextGenerate)
+	}
+	// 检测 lip-sync 模型，路由到 /v1/videos/advanced-lip-sync
+	if strings.Contains(strings.ToLower(body.ModelName), "lip-sync") || strings.Contains(strings.ToLower(body.Model), "lip-sync") {
+		c.Set("action", constant.TaskActionLipSync)
 	}
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -219,7 +241,9 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy 
 	case constant.TaskActionGenerate:
 		path = "/v1/videos/image2video"
 	case constant.TaskActionLipSync:
-		path = "/v1/videos/lip-sync"
+		path = "/v1/videos/advanced-lip-sync"
+	case constant.TaskActionIdentifyFace:
+		path = "/v1/videos/identify-face"
 	default:
 		path = "/v1/videos/text2video"
 	}
@@ -261,13 +285,61 @@ func (a *TaskAdaptor) GetChannelName() string {
 // helpers
 // ============================
 
+// convertLipSyncToKlingFormat 将统一扁平格式转换为 Kling 原生对口型格式
+// 统一格式: { session_id, face_id, audio_url, sound_start_time, ... }
+// Kling 原生: { session_id, face_choose: [{ face_id, sound_file, ... }] } (对口型)
+// Kling 原生: { video_url } (人脸识别)
+func (a *TaskAdaptor) convertLipSyncToKlingFormat(action string, metadata map[string]interface{}) (map[string]interface{}, error) {
+	// 移除不需要发送到上游的字段
+	delete(metadata, "model")
+	delete(metadata, "model_name")
+
+	if action == constant.TaskActionIdentifyFace {
+		// 人脸识别：直接传递 { video_url }，格式已经兼容
+		return metadata, nil
+	}
+
+	// 对口型生成：将扁平格式转换为 Kling 原生 face_choose 数组
+	result := map[string]interface{}{}
+
+	// 提取 session_id
+	if sessionId, ok := metadata["session_id"]; ok {
+		result["session_id"] = sessionId
+	}
+
+	// 构建 face_choose 数组
+	faceEntry := map[string]interface{}{}
+
+	// face_id
+	if faceId, ok := metadata["face_id"]; ok {
+		faceEntry["face_id"] = faceId
+	}
+
+	// audio_url → sound_file（Kling 字段名映射）
+	if audioUrl, ok := metadata["audio_url"]; ok {
+		faceEntry["sound_file"] = audioUrl
+	}
+
+	// 时间和音量参数（直接透传）
+	for _, key := range []string{"sound_start_time", "sound_end_time", "sound_insert_time", "sound_volume", "original_audio_volume"} {
+		if v, ok := metadata[key]; ok {
+			faceEntry[key] = v
+		}
+	}
+
+	result["face_choose"] = []interface{}{faceEntry}
+
+	return result, nil
+}
+
 // getEndpointPath 获取端点路径，支持从渠道配置中自定义
 func (a *TaskAdaptor) getEndpointPath(info *relaycommon.RelayInfo) string {
 	// 默认端点路径映射
 	defaultPaths := map[string]string{
 		constant.TaskActionGenerate:     "/v1/videos/image2video",
 		constant.TaskActionTextGenerate: "/v1/videos/text2video",
-		constant.TaskActionLipSync:      "/v1/videos/lip-sync",
+		constant.TaskActionLipSync:      "/v1/videos/advanced-lip-sync",
+		constant.TaskActionIdentifyFace: "/v1/videos/identify-face",
 	}
 
 	// 如果渠道配置了自定义端点路径，优先使用

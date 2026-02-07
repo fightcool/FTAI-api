@@ -43,6 +43,17 @@ func SetVideoRouter(router *gin.Engine) {
 		klingV1Router.GET("/videos/image2video/:task_id", controller.RelayTask)
 	}
 
+	// Kling 对口型路由（人脸识别 + 对口型生成 + 任务查询）
+	// 使用 KlingLipSyncConvert 中间件处理对口型特殊格式
+	klingLipSyncRouter := router.Group("/kling/v1")
+	klingLipSyncRouter.Use(middleware.KlingLipSyncConvert(), middleware.TokenAuth(), middleware.Distribute())
+	{
+		klingLipSyncRouter.POST("/videos/identify-face", controller.RelayTask)
+		klingLipSyncRouter.POST("/videos/advanced-lip-sync", controller.RelayTask)
+		klingLipSyncRouter.GET("/videos/advanced-lip-sync/:task_id", controller.RelayTask)
+		klingLipSyncRouter.GET("/videos/identify-face/:task_id", controller.RelayTask)
+	}
+
 	// Jimeng official API routes - direct mapping to official API format
 	jimengOfficialGroup := router.Group("jimeng")
 	jimengOfficialGroup.Use(middleware.JimengRequestConvert(), middleware.TokenAuth(), middleware.Distribute())

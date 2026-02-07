@@ -102,8 +102,11 @@ build_project() {
 
     if [ -f "$BINARY_NAME" ]; then
         chmod +x "$BINARY_NAME"
-        log_info "编译成功: $BINARY_NAME"
-        ls -lh "$BINARY_NAME"
+        # 复制为 PM2 使用的应用名，保持一致
+        cp "$BINARY_NAME" "$APP_NAME"
+        chmod +x "$APP_NAME"
+        log_info "编译成功: $BINARY_NAME -> $APP_NAME"
+        ls -lh "$APP_NAME"
     else
         log_error "编译失败"
         exit 1
@@ -119,14 +122,14 @@ restart_service() {
         pm2 restart "$APP_NAME"
         log_info "服务已重启"
     else
-        # 首次启动
-        pm2 start ecosystem.config.js
+        # 首次启动：直接用二进制文件路径注册
+        pm2 start "$APP_DIR/$APP_NAME" --name "$APP_NAME"
         pm2 save
         log_info "服务已启动"
     fi
 
-    # 等待服务启动
-    sleep 3
+    # 等待服务启动（数据库迁移需要约60秒）
+    sleep 5
 
     # 检查服务状态
     pm2 status "$APP_NAME"
@@ -134,10 +137,10 @@ restart_service() {
 
 # 健康检查
 health_check() {
-    log_info "执行健康检查..."
+    log_info "执行健康检查...（服务启动约需60秒，请耐心等待）"
 
-    # 等待服务完全启动
-    sleep 5
+    # 等待服务完全启动（数据库迁移需要约60秒）
+    sleep 65
 
     # 检查 API 是否响应
     HEALTH_URL="http://localhost:3000/api/status"
@@ -147,8 +150,8 @@ health_check() {
             log_info "健康检查通过"
             return 0
         fi
-        log_warn "健康检查失败，重试 $i/5..."
-        sleep 2
+        log_warn "健康检查失败，重试 $i/5...（等待10秒）"
+        sleep 10
     done
 
     log_error "健康检查失败，请检查日志"

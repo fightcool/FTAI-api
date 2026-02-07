@@ -33,6 +33,11 @@ type upstreamVideoRequest struct {
 	EnhancePrompt  bool     `json:"enhance_prompt,omitempty"`
 	EnableUpsample bool     `json:"enable_upsample,omitempty"`
 	AspectRatio    string   `json:"aspect_ratio,omitempty"`
+	// 🔥 Sora-2 必需参数
+	Size        string `json:"size,omitempty"`        // "small" 或 "large"
+	Orientation string `json:"orientation,omitempty"` // "portrait" 或 "landscape"
+	Duration    int    `json:"duration,omitempty"`    // 视频时长（秒）
+	Watermark   string `json:"watermark,omitempty"`   // "true" 或 "false"
 }
 
 // responseTask 上游 API 响应格式
@@ -204,6 +209,20 @@ func (a *TaskAdaptor) convertToUpstreamFormat(req *relaycommon.TaskSubmitReq, in
 		if enableUpsample, ok := req.Metadata["enable_upsample"].(bool); ok {
 			upstreamReq.EnableUpsample = enableUpsample
 		}
+	}
+
+	// 🔥 处理 Sora-2 必需参数（从顶层参数读取）
+	if req.Size != "" {
+		upstreamReq.Size = req.Size
+	}
+	if req.Orientation != "" {
+		upstreamReq.Orientation = req.Orientation
+	}
+	if req.Duration > 0 {
+		upstreamReq.Duration = req.Duration
+	}
+	if req.Watermark != "" {
+		upstreamReq.Watermark = req.Watermark
 	}
 
 	if len(images) > 0 {
