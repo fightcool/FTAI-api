@@ -215,14 +215,16 @@ func (a *TaskAdaptor) convertToUpstreamFormat(req *relaycommon.TaskSubmitReq, in
 	if req.Size != "" {
 		upstreamReq.Size = req.Size
 	}
-	if req.Orientation != "" {
-		upstreamReq.Orientation = req.Orientation
+	if req.Metadata != nil {
+		if orientation, ok := req.Metadata["orientation"].(string); ok && orientation != "" {
+			upstreamReq.Orientation = orientation
+		}
+		if watermark, ok := req.Metadata["watermark"].(string); ok && watermark != "" {
+			upstreamReq.Watermark = watermark
+		}
 	}
 	if req.Duration > 0 {
 		upstreamReq.Duration = req.Duration
-	}
-	if req.Watermark != "" {
-		upstreamReq.Watermark = req.Watermark
 	}
 
 	if len(images) > 0 {
