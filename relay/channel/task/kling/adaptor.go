@@ -340,8 +340,19 @@ func (a *TaskAdaptor) convertLipSyncToKlingFormat(action string, metadata map[st
 		faceEntry["sound_file"] = audioUrl
 	}
 
-	// 时间和音量参数（直接透传）
-	for _, key := range []string{"sound_start_time", "sound_end_time", "sound_insert_time", "sound_volume", "original_audio_volume"} {
+	// 时间参数（转为整数，Kling API 要求 integer 类型）
+	for _, key := range []string{"sound_start_time", "sound_end_time", "sound_insert_time"} {
+		if v, ok := metadata[key]; ok {
+			if f, ok := v.(float64); ok {
+				faceEntry[key] = int(f)
+			} else {
+				faceEntry[key] = v
+			}
+		}
+	}
+
+	// 音量参数（保持浮点数，Kling API 取值范围 [0, 2]）
+	for _, key := range []string{"sound_volume", "original_audio_volume"} {
 		if v, ok := metadata[key]; ok {
 			faceEntry[key] = v
 		}
