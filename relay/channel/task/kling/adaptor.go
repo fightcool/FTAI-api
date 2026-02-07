@@ -598,6 +598,12 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 			Code:    fmt.Sprintf("%d", klingResp.Code),
 		}
 	}
+	// 如果任务失败且有失败原因（来自后台轮询器更新），补充到 Error 中
+	if originTask.Status == model.TaskStatusFailure && openAIVideo.Error == nil && originTask.FailReason != "" {
+		openAIVideo.Error = &dto.OpenAIVideoError{
+			Message: originTask.FailReason,
+		}
+	}
 	jsonData, _ := common.Marshal(openAIVideo)
 	return jsonData, nil
 }
