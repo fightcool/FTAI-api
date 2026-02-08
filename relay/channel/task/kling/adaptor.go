@@ -533,6 +533,25 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		}
 	}
 
+	// 兼容扁平响应格式（如 lip-sync 失败时上游返回 {"id":"...","status":"failed","error":"..."}）
+	// 此时 raw.Data 为空，td.TaskStatus 也为空，需要从顶层字段解析
+	if td.TaskStatus == "" {
+		var flat struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := json.Unmarshal(respBody, &flat); err == nil && flat.Status != "" {
+			td.TaskStatus = flat.Status
+			if flat.ID != "" {
+				td.TaskId = flat.ID
+			}
+			if flat.Error != "" {
+				taskInfo.Reason = flat.Error
+			}
+		}
+	}
+
 	taskInfo.TaskID = td.TaskId
 
 	// 如果 task_status_msg 有值，用它作为失败原因（比顶层 message 更具体）
@@ -540,21 +559,27 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskInfo.Reason = td.TaskStatusMsg
 	}
 
-	//任务状态，枚举值：submitted（已提交）、processing（处理中）、succeed（成功）、failed（失败）
-	status := td.TaskStatus
+	// 任务状态映射（兼容不同上游的状态值，统一转为小写比较）
+	status := strings.ToLower(strings.TrimSpace(td.TaskStatus))
 	switch status {
-	case "submitted":
+	case "submitted", "queued", "pending":
 		taskInfo.Status = model.TaskStatusSubmitted
-	case "processing":
+	case "processing", "running", "in_progress", "in-progress":
 		taskInfo.Status = model.TaskStatusInProgress
-	case "succeed":
+	case "succeed", "succeeded", "success", "completed", "complete":
 		taskInfo.Status = model.TaskStatusSuccess
-	case "failed":
+	case "failed", "failure", "error":
 		taskInfo.Status = model.TaskStatusFailure
 	default:
 		// 如果 code != 0 但 data 中没有 task_status，视为失败
 		if raw.Code != 0 {
 			taskInfo.Status = model.TaskStatusFailure
+			return taskInfo, nil
+		}
+		// 状态为空且无法识别，视为失败并记录日志
+		if status == "" {
+			taskInfo.Status = model.TaskStatusFailure
+			taskInfo.Reason = fmt.Sprintf("upstream returned empty task status (raw: %s)", string(respBody)[:min(len(respBody), 200)])
 			return taskInfo, nil
 		}
 		return nil, fmt.Errorf("unknown task status: %s (raw response: %s)", status, string(respBody)[:min(len(respBody), 500)])
