@@ -50,6 +50,9 @@ const (
 	RelayModeRealtime
 
 	RelayModeGemini
+
+	RelayModeVoiceDesign // MiniMax voice design
+	RelayModeGetVoice    // MiniMax get voice list
 )
 
 func Path2RelayMode(path string) int {
@@ -80,6 +83,10 @@ func Path2RelayMode(path string) int {
 		relayMode = RelayModeAudioTranslation
 	} else if strings.HasPrefix(path, "/v1/rerank") {
 		relayMode = RelayModeRerank
+	} else if strings.HasPrefix(path, "/v1/voice_design") {
+		relayMode = RelayModeVoiceDesign
+	} else if strings.HasPrefix(path, "/v1/get_voice") {
+		relayMode = RelayModeGetVoice
 	} else if strings.HasPrefix(path, "/v1/realtime") {
 		relayMode = RelayModeRealtime
 	} else if strings.HasPrefix(path, "/v1beta/models") || strings.HasPrefix(path, "/v1/models") {

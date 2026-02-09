@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -30,6 +31,21 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+	// voice_design / get_voice: 直接透传原始请求体到 MiniMax
+	if info.RelayMode == constant.RelayModeVoiceDesign || info.RelayMode == constant.RelayModeGetVoice {
+		body, err := common.GetRequestBody(c)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get request body: %w", err)
+		}
+		// 移除 model 字段（仅用于网关路由选择，MiniMax API 不需要）
+		var bodyMap map[string]any
+		if err := json.Unmarshal(body, &bodyMap); err == nil {
+			delete(bodyMap, "model")
+			body, _ = json.Marshal(bodyMap)
+		}
+		return bytes.NewReader(body), nil
+	}
+
 	if info.RelayMode != constant.RelayModeAudioSpeech {
 		return nil, errors.New("unsupported audio relay mode")
 	}
@@ -117,6 +133,15 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
 	if info.RelayMode == constant.RelayModeAudioSpeech {
 		return handleTTSResponse(c, resp, info)
+	}
+
+	// voice_design / get_voice: 直接透传 MiniMax 响应，不消耗配额
+	if info.RelayMode == constant.RelayModeVoiceDesign || info.RelayMode == constant.RelayModeGetVoice {
+		_, apiErr := handleChatCompletionResponse(c, resp, info)
+		if apiErr != nil {
+			return nil, apiErr
+		}
+		return &dto.Usage{}, nil
 	}
 
 	adaptor := openai.Adaptor{}
