@@ -122,12 +122,12 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatOpenAIAudio)
 		})
 
-		// MiniMax voice management routes
+		// MiniMax voice management routes (使用 OpenAI 格式，走 GeneralOpenAIRequest 解析)
 		httpRouter.POST("/voice_design", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
+			controller.Relay(c, types.RelayFormatOpenAI)
 		})
 		httpRouter.POST("/get_voice", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
+			controller.Relay(c, types.RelayFormatOpenAI)
 		})
 
 		// rerank related routes

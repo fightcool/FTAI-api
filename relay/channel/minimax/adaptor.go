@@ -31,21 +31,6 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
-	// voice_design / get_voice: 直接透传原始请求体到 MiniMax
-	if info.RelayMode == constant.RelayModeVoiceDesign || info.RelayMode == constant.RelayModeGetVoice {
-		body, err := common.GetRequestBody(c)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get request body: %w", err)
-		}
-		// 移除 model 字段（仅用于网关路由选择，MiniMax API 不需要）
-		var bodyMap map[string]any
-		if err := json.Unmarshal(body, &bodyMap); err == nil {
-			delete(bodyMap, "model")
-			body, _ = json.Marshal(bodyMap)
-		}
-		return bytes.NewReader(body), nil
-	}
-
 	if info.RelayMode != constant.RelayModeAudioSpeech {
 		return nil, errors.New("unsupported audio relay mode")
 	}
@@ -110,6 +95,19 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
 	if request == nil {
 		return nil, errors.New("request is nil")
+	}
+	// voice_design / get_voice: 透传原始请求体到 MiniMax（移除 model 字段）
+	if info.RelayMode == constant.RelayModeVoiceDesign || info.RelayMode == constant.RelayModeGetVoice {
+		body, err := common.GetRequestBody(c)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get request body: %w", err)
+		}
+		var bodyMap map[string]any
+		if err := json.Unmarshal(body, &bodyMap); err != nil {
+			return nil, fmt.Errorf("failed to parse request body: %w", err)
+		}
+		delete(bodyMap, "model")
+		return bodyMap, nil
 	}
 	return request, nil
 }
