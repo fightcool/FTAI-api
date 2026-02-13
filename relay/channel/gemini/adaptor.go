@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -177,35 +178,45 @@ func (a *Adaptor) convertImageRequestToGeminiChat(c *gin.Context, info *relaycom
 			// Pixel dimension format (e.g., "1920x1080")
 			switch size {
 			// Square 1:1
-			case "256x256", "512x512", "1024x1024":
+			case "256x256", "512x512", "1024x1024", "2048x2048", "4096x4096":
 				aspectRatio = "1:1"
 			// Landscape 16:9
-			case "1792x1024", "1920x1080", "1280x720":
+			case "1792x1024", "1920x1080", "1280x720", "3840x2160", "7680x4320":
 				aspectRatio = "16:9"
 			// Portrait 9:16
-			case "1024x1792", "1080x1920", "720x1280":
+			case "1024x1792", "1080x1920", "720x1280", "2160x3840", "4320x7680":
 				aspectRatio = "9:16"
 			// Landscape 4:3
-			case "1024x768", "1280x960", "1600x1200":
+			case "1024x768", "1280x960", "1600x1200", "2880x2160", "5760x4320":
 				aspectRatio = "4:3"
 			// Portrait 3:4
-			case "768x1024", "960x1280", "1200x1600":
+			case "768x1024", "960x1280", "1200x1600", "2160x2880", "4320x5760":
 				aspectRatio = "3:4"
 			// Landscape 3:2
-			case "1536x1024", "1440x960", "1800x1200":
+			case "1536x1024", "1440x960", "1800x1200", "3240x2160", "6480x4320":
 				aspectRatio = "3:2"
 			// Portrait 2:3
-			case "1024x1536", "960x1440", "1200x1800":
+			case "1024x1536", "960x1440", "1200x1800", "2160x3240", "4320x6480":
 				aspectRatio = "2:3"
 			// Landscape 21:9 (ultrawide)
-			case "2560x1080", "3440x1440":
+			case "2560x1080", "3440x1440", "3840x1646", "7680x3291":
 				aspectRatio = "21:9"
 			// Flexible 5:4
-			case "1280x1024", "1600x1280":
+			case "1280x1024", "1600x1280", "2700x2160", "5400x4320":
 				aspectRatio = "5:4"
 			// Flexible 4:5
-			case "1024x1280", "1280x1600":
+			case "1024x1280", "1280x1600", "2160x2700", "4320x5400":
 				aspectRatio = "4:5"
+			default:
+				// Fallback: calculate aspect ratio from pixel dimensions using GCD
+				if parts := strings.SplitN(size, "x", 2); len(parts) == 2 {
+					w, errW := strconv.Atoi(parts[0])
+					h, errH := strconv.Atoi(parts[1])
+					if errW == nil && errH == nil && w > 0 && h > 0 {
+						g := gcd(w, h)
+						aspectRatio = fmt.Sprintf("%d:%d", w/g, h/g)
+					}
+				}
 			}
 		}
 	}
@@ -215,7 +226,7 @@ func (a *Adaptor) convertImageRequestToGeminiChat(c *gin.Context, info *relaycom
 	imageSize := "1K" // default
 	if request.Quality != "" {
 		switch request.Quality {
-		case "hd", "high", "4K":
+		case "hd", "high", "4K", "8K":
 			imageSize = "4K"
 		case "2K":
 			imageSize = "2K"
@@ -595,4 +606,13 @@ func handleVideoGenerationRequest(request *dto.GeminiChatRequest) error {
 	}
 
 	return nil
+}
+
+// gcd calculates the Greatest Common Divisor using Euclidean algorithm.
+// Used for dynamic aspect ratio calculation from pixel dimensions.
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
