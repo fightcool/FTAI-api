@@ -2516,6 +2516,46 @@ export function ChannelMutateDrawer({
                   </Button>
                 </div>
               </div>
+              <FormField
+                control={form.control}
+                name='balance_currency'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Balance currency')}</FormLabel>
+                    <Select
+                      disabled={sensitiveLocked || isSubmitting}
+                      items={[
+                        { value: 'auto', label: t('Auto') },
+                        { value: 'USD', label: 'USD' },
+                        { value: 'CNY', label: 'CNY' },
+                      ]}
+                      value={field.value === 'USD' || field.value === 'CNY' ? field.value : 'auto'}
+                      onValueChange={(value) => {
+                        field.onChange(value === 'USD' || value === 'CNY' ? value : '')
+                      }}
+                    >
+                      <FormControl>
+                        <SelectTrigger className='w-40'>
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent alignItemWithTrigger={false}>
+                        <SelectGroup>
+                          <SelectItem value='auto'>{t('Auto')}</SelectItem>
+                          <SelectItem value='USD'>USD</SelectItem>
+                          <SelectItem value='CNY'>CNY</SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FormDescription>
+                      {t(
+                        'Overrides the currency the upstream reports balances in; CNY is converted to USD with the exchange rate before storing'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
               <FormControl>
                 <JsonCodeEditor
                   value={field.value || ''}

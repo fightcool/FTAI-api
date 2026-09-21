@@ -247,6 +247,7 @@ export const channelFormSchema = z
       .string()
       .optional()
       .refine(isOptionalJsonObject, ERROR_MESSAGES.INVALID_JSON),
+    balance_currency: z.enum(['', 'USD', 'CNY']).optional(),
     settings: z
       .string()
       .optional()
@@ -437,6 +438,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   param_override: '',
   header_override: '',
   usage_query_template: '',
+  balance_currency: '',
   settings: '{}',
   other: '',
   multi_key_mode: 'single',
@@ -537,6 +539,7 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateIgnoredModels = ''
   let advancedCustom = ''
   let usageQueryTemplate = ''
+  let balanceCurrency: '' | 'USD' | 'CNY' = ''
 
   if (channel.settings) {
     try {
@@ -568,6 +571,9 @@ export function transformChannelToFormDefaults(
       usageQueryTemplate = parsed.usage_query_template
         ? JSON.stringify(parsed.usage_query_template, null, 2)
         : ''
+      if (parsed.balance_currency === 'USD' || parsed.balance_currency === 'CNY') {
+        balanceCurrency = parsed.balance_currency
+      }
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('Failed to parse channel settings:', error)
@@ -620,6 +626,7 @@ export function transformChannelToFormDefaults(
     upstream_model_update_ignored_models: upstreamModelUpdateIgnoredModels,
     advanced_custom: advancedCustom,
     usage_query_template: usageQueryTemplate,
+    balance_currency: balanceCurrency,
   }
 }
 
@@ -803,6 +810,12 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     }
   } else if ('usage_query_template' in settingsObj) {
     delete settingsObj.usage_query_template
+  }
+
+  if (formData.balance_currency === 'USD' || formData.balance_currency === 'CNY') {
+    settingsObj.balance_currency = formData.balance_currency
+  } else if ('balance_currency' in settingsObj) {
+    delete settingsObj.balance_currency
   }
 
   return JSON.stringify(settingsObj)

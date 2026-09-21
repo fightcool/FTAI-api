@@ -54,6 +54,7 @@ const CONFIGURATION_BLOCKS = {
       'param_override',
       'header_override',
       'usage_query_template',
+      'balance_currency',
     ],
   },
   requestProcessing: {

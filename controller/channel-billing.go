@@ -546,8 +546,15 @@ func fetchUsageTemplateBalance(channel *model.Channel, template *dto.ChannelUsag
 		}
 		return channelBalanceResult{RawResponse: string(formatted)}, nil
 	}
-	details.Currency = usageTemplateCurrency(body, template)
-	if details.Currency == "CNY" {
+	// The channel-level override wins: upstream currency labels cannot always
+	// be trusted.
+	otherSettings := channel.GetOtherSettings()
+	currency := otherSettings.NormalizedBalanceCurrency()
+	if currency == "" {
+		currency = usageTemplateCurrency(body, template)
+	}
+	details.Currency = currency
+	if currency == "CNY" {
 		storeValue = convertCNYToUSD(storeValue)
 	}
 	channel.UpdateBalance(storeValue)
@@ -701,6 +708,12 @@ func updateStandardChannelBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	balance := subscription.HardLimitUSD - usage.TotalUsage/100
+	// Generic OpenAI-compatible billing endpoints report an unknown currency;
+	// a channel-level CNY declaration converts before storing.
+	otherSettings := channel.GetOtherSettings()
+	if otherSettings.NormalizedBalanceCurrency() == "CNY" {
+		balance = convertCNYToUSD(balance)
+	}
 	channel.UpdateBalance(balance)
 	return balance, nil
 }

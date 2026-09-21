@@ -992,6 +992,9 @@ func (channel *Channel) ValidateSettings() error {
 	if err := channelOtherSettings.ValidateToolLossPolicy(); err != nil {
 		return err
 	}
+	if err := channelOtherSettings.ValidateBalanceCurrency(); err != nil {
+		return err
+	}
 	if err := channelOtherSettings.UsageQueryTemplate.Validate(); err != nil {
 		return err
 	}

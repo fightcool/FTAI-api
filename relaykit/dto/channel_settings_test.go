@@ -720,3 +720,14 @@ func TestChannelUsageQueryTemplateValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestChannelOtherSettingsValidateBalanceCurrency(t *testing.T) {
+	require.NoError(t, (*ChannelOtherSettings)(nil).ValidateBalanceCurrency())
+	require.NoError(t, (&ChannelOtherSettings{}).ValidateBalanceCurrency())
+	require.NoError(t, (&ChannelOtherSettings{BalanceCurrency: "USD"}).ValidateBalanceCurrency())
+	require.NoError(t, (&ChannelOtherSettings{BalanceCurrency: " cny "}).ValidateBalanceCurrency())
+
+	err := (&ChannelOtherSettings{BalanceCurrency: "EUR"}).ValidateBalanceCurrency()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "balance_currency")
+}

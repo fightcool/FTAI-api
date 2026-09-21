@@ -111,6 +111,7 @@ export interface ChannelOtherSettings {
   upstream_model_update_last_detected_models?: string[]
   advanced_custom?: AdvancedCustomConfig
   usage_query_template?: ChannelUsageQueryTemplate
+  balance_currency?: 'USD' | 'CNY'
 }
 
 export interface ChannelUsageQueryTemplate {

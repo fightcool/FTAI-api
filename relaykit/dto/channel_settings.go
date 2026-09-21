@@ -72,13 +72,40 @@ const (
 	UsageQueryTemplateKind = "template"
 	// UsageQueryURLPlaceholder resolves to the channel's effective base URL.
 	UsageQueryURLPlaceholder = "{baseUrl}"
+
+	BalanceCurrencyUSD = "USD"
+	BalanceCurrencyCNY = "CNY"
 )
+
+// ValidateBalanceCurrency validates the channel-level balance currency
+// override. Empty keeps auto detection.
+func (s *ChannelOtherSettings) ValidateBalanceCurrency() error {
+	if s == nil {
+		return nil
+	}
+	switch s.NormalizedBalanceCurrency() {
+	case "", BalanceCurrencyUSD, BalanceCurrencyCNY:
+		return nil
+	default:
+		return fmt.Errorf("invalid balance_currency: %s", s.BalanceCurrency)
+	}
+}
+
+// NormalizedBalanceCurrency returns the upper-trimmed balance currency
+// override, or "" when unset.
+func (s *ChannelOtherSettings) NormalizedBalanceCurrency() string {
+	if s == nil {
+		return ""
+	}
+	return strings.ToUpper(strings.TrimSpace(s.BalanceCurrency))
+}
 
 // ChannelUsageQueryTemplate is a per-channel upstream usage/balance query
 // template used by channel management. Mapping values are gjson dot paths into
-// the upstream JSON response. Currency resolution: mapping.currency wins over
-// unit; unset means USD. CNY values are converted to the stored USD convention
-// by the host before writing the channel balance.
+// the upstream JSON response. Currency resolution: the channel-level
+// balance_currency override wins over mapping.currency, which wins over unit;
+// unset means USD. CNY values are converted to the stored USD convention by
+// the host before writing the channel balance.
 type ChannelUsageQueryTemplate struct {
 	Kind    string            `json:"kind,omitempty"`
 	URL     string            `json:"url"`
@@ -151,6 +178,10 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateIgnoredModels      []string                   `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig      `json:"advanced_custom,omitempty"`
 	UsageQueryTemplate                    *ChannelUsageQueryTemplate `json:"usage_query_template,omitempty"`
+	// BalanceCurrency explicitly declares the currency the upstream reports
+	// balances in, overriding any currency the upstream or template claims.
+	// Accepted values: "", "USD", "CNY". Empty keeps auto detection.
+	BalanceCurrency string `json:"balance_currency,omitempty"`
 	// ToolLossPolicy is a channel-level opt-in for request-phase conversion
 	// rejection. Empty follows the default allow policy. Accepted values:
 	// "", "allow", "safe", "strict".

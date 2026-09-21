@@ -189,3 +189,53 @@ func TestUpdateChannelDeepSeekBalanceConvertsCNYToUSD(t *testing.T) {
 	require.NoError(t, err)
 	assert.InDelta(t, 6.79/7.3, stored.Balance, 1e-9)
 }
+
+func TestFetchUsageTemplateBalanceCurrencyOverride(t *testing.T) {
+	newUsageTemplateTestDB(t)
+	setTestExchangeRate(t, 7.3)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"remaining": "6.79", "unit": "USD"}`))
+	}))
+	defer server.Close()
+
+	channel := newUsageTemplateChannel(t, constant.ChannelTypeCustom, server.URL, testUsageTemplate())
+	// Upstream claims USD but the wallet is actually CNY; the channel-level
+	// override must win over the response label.
+	channel.SetOtherSettings(dto.ChannelOtherSettings{
+		UsageQueryTemplate: testUsageTemplate(),
+		BalanceCurrency:    "CNY",
+	})
+
+	result, err := updateChannelBalance(channel)
+	require.NoError(t, err)
+	require.InDelta(t, 6.79/7.3, result.Balance, 1e-9)
+	require.NotNil(t, result.Usage)
+	assert.Equal(t, "CNY", result.Usage.Currency)
+}
+
+func TestUpdateStandardChannelBalanceAppliesCurrencyOverride(t *testing.T) {
+	newUsageTemplateTestDB(t)
+	setTestExchangeRate(t, 7.3)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/dashboard/billing/subscription", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"billing_subscription","has_payment_method":true,"hard_limit_usd":100,"soft_limit_usd":100,"system_hard_limit_usd":100,"access_until":0}`))
+	})
+	mux.HandleFunc("/v1/dashboard/billing/usage", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","total_usage":730}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	channel := newUsageTemplateChannel(t, constant.ChannelTypeCustom, server.URL, nil)
+	channel.SetOtherSettings(dto.ChannelOtherSettings{BalanceCurrency: "CNY"})
+
+	result, err := updateChannelBalance(channel)
+	require.NoError(t, err)
+	// Raw balance 100 - 7.30 = 92.70, declared CNY → stored 92.70/7.3.
+	require.InDelta(t, 92.7/7.3, result.Balance, 1e-9)
+}
