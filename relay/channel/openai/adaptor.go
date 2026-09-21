@@ -9,26 +9,30 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"path/filepath"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/ai360"
 	"github.com/QuantumNous/new-api/relay/channel/lingyiwanwu"
+	"github.com/QuantumNous/new-api/relay/channel/openrouter"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	//"github.com/QuantumNous/new-api/relay/channel/minimax"
-	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	"github.com/QuantumNous/new-api/relay/channel/xinference"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/common_handler"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/setting/reasoning"
+	"github.com/samber/lo"
 
 	"github.com/gin-gonic/gin"
 )
@@ -38,26 +42,14 @@ type Adaptor struct {
 	ResponseFormat string
 }
 
-// parseReasoningEffortFromModelSuffix 从模型名称中解析推理级别
-// support OAI models: o1-mini/o3-mini/o4-mini/o1/o3 etc...
-// minimal effort only available in gpt-5
-func parseReasoningEffortFromModelSuffix(model string) (string, string) {
-	effortSuffixes := []string{"-high", "-minimal", "-low", "-medium", "-none", "-xhigh"}
-	for _, suffix := range effortSuffixes {
-		if strings.HasSuffix(model, suffix) {
-			effort := strings.TrimPrefix(suffix, "-")
-			originModel := strings.TrimSuffix(model, suffix)
-			return effort, originModel
-		}
-	}
-	return "", model
-}
-
 func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
-	// 使用 service.GeminiToOpenAIRequest 转换请求格式
-	openaiRequest, err := service.GeminiToOpenAIRequest(request, info)
+	result, err := service.ConvertRequest(c, info, types.RelayFormatOpenAI, request)
 	if err != nil {
 		return nil, err
+	}
+	openaiRequest, ok := result.Value.(*dto.GeneralOpenAIRequest)
+	if !ok {
+		return nil, fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value)
 	}
 	return a.ConvertOpenAIRequest(c, info, openaiRequest)
 }
@@ -73,9 +65,13 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 	//		println(fmt.Sprintf("failed to save request body to file: %v", err))
 	//	}
 	//}
-	aiRequest, err := service.ClaudeToOpenAIRequest(*request, info)
+	result, err := service.ConvertRequest(c, info, types.RelayFormatOpenAI, request)
 	if err != nil {
 		return nil, err
+	}
+	aiRequest, ok := result.Value.(*dto.GeneralOpenAIRequest)
+	if !ok {
+		return nil, fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value)
 	}
 	//if common.DebugEnabled {
 	//	println(fmt.Sprintf("convert claude to openai request result: %s", common.GetJsonString(aiRequest)))
@@ -109,12 +105,12 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	if info.RelayMode == relayconstant.RelayModeRealtime {
-		if strings.HasPrefix(info.ChannelBaseUrl, "https://") {
-			baseUrl := strings.TrimPrefix(info.ChannelBaseUrl, "https://")
+		if after, ok := strings.CutPrefix(info.ChannelBaseUrl, "https://"); ok {
+			baseUrl := after
 			baseUrl = "wss://" + baseUrl
 			info.ChannelBaseUrl = baseUrl
-		} else if strings.HasPrefix(info.ChannelBaseUrl, "http://") {
-			baseUrl := strings.TrimPrefix(info.ChannelBaseUrl, "http://")
+		} else if after, ok := strings.CutPrefix(info.ChannelBaseUrl, "http://"); ok {
+			baseUrl := after
 			baseUrl = "ws://" + baseUrl
 			info.ChannelBaseUrl = baseUrl
 		}
@@ -135,8 +131,8 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			task = "chat/completions" + task
 		}
 
-		// 特殊处理 responses API
-		if info.RelayMode == relayconstant.RelayModeResponses {
+		// 特殊处理 responses API（包含 compact）
+		if info.RelayMode == relayconstant.RelayModeResponses || info.RelayMode == relayconstant.RelayModeResponsesCompact {
 			responsesApiVersion := "preview"
 
 			subUrl := "/openai/v1/responses"
@@ -147,6 +143,11 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 
 			if info.ChannelOtherSettings.AzureResponsesVersion != "" {
 				responsesApiVersion = info.ChannelOtherSettings.AzureResponsesVersion
+			}
+
+			// compact 模式追加 /compact
+			if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+				subUrl = subUrl + "/compact"
 			}
 
 			requestURL = fmt.Sprintf("%s?api-version=%s", subUrl, responsesApiVersion)
@@ -171,7 +172,9 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 		url = strings.Replace(url, "{model}", info.UpstreamModelName, -1)
 		return url, nil
 	default:
-		if info.RelayFormat == types.RelayFormatClaude || info.RelayFormat == types.RelayFormatGemini {
+		if (info.RelayFormat == types.RelayFormatClaude || info.RelayFormat == types.RelayFormatGemini) &&
+			info.RelayMode != relayconstant.RelayModeResponses &&
+			info.RelayMode != relayconstant.RelayModeResponsesCompact {
 			return fmt.Sprintf("%s/v1/chat/completions", info.ChannelBaseUrl), nil
 		}
 		return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, info.RequestURLPath, info.ChannelType), nil
@@ -187,28 +190,54 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 	if info.ChannelType == constant.ChannelTypeOpenAI && "" != info.Organization {
 		header.Set("OpenAI-Organization", info.Organization)
 	}
+	// 检查 Header Override 是否已设置 Authorization，如果已设置则跳过默认设置
+	// 这样可以避免在 Header Override 应用时被覆盖（虽然 Header Override 会在之后应用，但这里作为额外保护）
+	hasAuthOverride := false
+	if len(info.HeadersOverride) > 0 {
+		for k := range info.HeadersOverride {
+			if strings.EqualFold(k, "Authorization") {
+				hasAuthOverride = true
+				break
+			}
+		}
+	}
 	if info.RelayMode == relayconstant.RelayModeRealtime {
+		// OpenAI 已下线 Realtime Beta API,GA 模型收到 beta 标识会以 beta_api_shape_disabled 拒绝;
+		// 仅对遗留 preview 模型保留 beta 标识
+		legacyRealtimeBeta := strings.Contains(info.UpstreamModelName, "-realtime-preview")
 		swp := c.Request.Header.Get("Sec-WebSocket-Protocol")
 		if swp != "" {
 			items := []string{
 				"realtime",
 				"openai-insecure-api-key." + info.ApiKey,
-				"openai-beta.realtime-v1",
+			}
+			if legacyRealtimeBeta {
+				items = append(items, "openai-beta.realtime-v1")
 			}
 			header.Set("Sec-WebSocket-Protocol", strings.Join(items, ","))
 			//req.Header.Set("Sec-WebSocket-Key", c.Request.Header.Get("Sec-WebSocket-Key"))
 			//req.Header.Set("Sec-Websocket-Extensions", c.Request.Header.Get("Sec-Websocket-Extensions"))
 			//req.Header.Set("Sec-Websocket-Version", c.Request.Header.Get("Sec-Websocket-Version"))
 		} else {
-			header.Set("openai-beta", "realtime=v1")
-			header.Set("Authorization", "Bearer "+info.ApiKey)
+			if legacyRealtimeBeta {
+				header.Set("openai-beta", "realtime=v1")
+			}
+			if !hasAuthOverride {
+				header.Set("Authorization", "Bearer "+info.ApiKey)
+			}
 		}
 	} else {
-		header.Set("Authorization", "Bearer "+info.ApiKey)
+		if !hasAuthOverride {
+			header.Set("Authorization", "Bearer "+info.ApiKey)
+		}
 	}
 	if info.ChannelType == constant.ChannelTypeOpenRouter {
-		header.Set("HTTP-Referer", "https://www.newapi.ai")
-		header.Set("X-Title", "New API")
+		if header.Get("HTTP-Referer") == "" {
+			header.Set("HTTP-Referer", "https://www.newapi.ai")
+		}
+		if header.Get("X-OpenRouter-Title") == "" {
+			header.Set("X-OpenRouter-Title", "New API")
+		}
 	}
 	return nil
 }
@@ -220,116 +249,179 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if info.ChannelType != constant.ChannelTypeOpenAI && info.ChannelType != constant.ChannelTypeAzure {
 		request.StreamOptions = nil
 	}
+	// Nested reasoning is an OpenRouter-compatible input dialect and needs
+	// projection even without a protocol conversion hop. Native top-level
+	// reasoning_effort stays untouched unless a modifier or conversion applies.
+	// OpenRouter retains its own dialect normalization below.
+	preserveSuffix := model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName) || model_setting.ShouldPreserveThinkingSuffix(info.UpstreamModelName)
+	upstreamEffort, _ := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.UpstreamModelName)
+	originEffort, _ := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.OriginModelName)
+	renderReasoning := len(request.Reasoning) > 0 || len(info.RequestConversionChain) > 1 || request.ReasoningConversion != nil || info.ReasoningState() != nil ||
+		!preserveSuffix && (upstreamEffort != "" || originEffort != "")
+	if info.ChannelType != constant.ChannelTypeOpenRouter && !renderReasoning {
+		info.SetReasoningEffort(request.ReasoningEffort)
+	}
 	if info.ChannelType == constant.ChannelTypeOpenRouter {
+		initialIntent, err := kitreasoning.FromOpenAIChat(request)
+		if err != nil {
+			return nil, kitreasoning.AsClientError(err)
+		}
+		if request.THINKING != nil && strings.HasPrefix(info.UpstreamModelName, "anthropic") {
+			var thinking dto.Thinking
+			if err := common.Unmarshal(request.THINKING, &thinking); err != nil {
+				return nil, fmt.Errorf("error Unmarshal thinking: %w", err)
+			}
+			legacyIntent, err := kitreasoning.FromClaude(&dto.ClaudeRequest{Thinking: &thinking})
+			if err != nil {
+				return nil, kitreasoning.AsClientError(err)
+			}
+			initialIntent, err = kitreasoning.MergeExplicit(initialIntent, legacyIntent, request.Model)
+			if err != nil {
+				return nil, kitreasoning.AsClientError(err)
+			}
+			request.THINKING = nil
+		}
 		if len(request.Usage) == 0 {
 			request.Usage = json.RawMessage(`{"include":true}`)
 		}
-		// 适配 OpenRouter 的 thinking 后缀
-		if !model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName) &&
-			strings.HasSuffix(info.UpstreamModelName, "-thinking") {
-			info.UpstreamModelName = strings.TrimSuffix(info.UpstreamModelName, "-thinking")
-			request.Model = info.UpstreamModelName
-			if len(request.Reasoning) == 0 {
-				reasoning := map[string]any{
-					"enabled": true,
-				}
-				if request.ReasoningEffort != "" && request.ReasoningEffort != "none" {
-					reasoning["effort"] = request.ReasoningEffort
-				}
-				marshal, err := common.Marshal(reasoning)
-				if err != nil {
-					return nil, fmt.Errorf("error marshalling reasoning: %w", err)
-				}
-				request.Reasoning = marshal
+		// 合并 effort 尾巴产生的意图
+		mergeEffortSuffix := func(modelName string) error {
+			rawEffort, _ := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(modelName)
+			if rawEffort == "" {
+				return nil
 			}
-			// 清空多余的ReasoningEffort
-			request.ReasoningEffort = ""
-		} else {
-			if len(request.Reasoning) == 0 {
-				// 适配 OpenAI 的 ReasoningEffort 格式
-				if request.ReasoningEffort != "" {
-					reasoning := map[string]any{
-						"enabled": true,
-					}
-					if request.ReasoningEffort != "none" {
-						reasoning["effort"] = request.ReasoningEffort
-						marshal, err := common.Marshal(reasoning)
-						if err != nil {
-							return nil, fmt.Errorf("error marshalling reasoning: %w", err)
-						}
-						request.Reasoning = marshal
-					}
-				}
+			effort, err := kitreasoning.ParseEffort(rawEffort)
+			if err != nil {
+				return err
 			}
-			request.ReasoningEffort = ""
+			mode := kitreasoning.ModeEnabled
+			if effort == kitreasoning.EffortNone {
+				mode = kitreasoning.ModeDisabled
+			}
+			initialIntent, err = kitreasoning.MergeExplicitAndSuffix(initialIntent, kitreasoning.Intent{Mode: mode, Effort: effort, Source: kitreasoning.SourceSuffix}, modelName)
+			return err
 		}
-
-		// https://docs.anthropic.com/en/api/openai-sdk#extended-thinking-support
-		// 没有做排除3.5Haiku等，要出问题再加吧，最佳兼容性（不是
-		if request.THINKING != nil && strings.HasPrefix(info.UpstreamModelName, "anthropic") {
-			var thinking dto.Thinking // Claude标准Thinking格式
-			if err := json.Unmarshal(request.THINKING, &thinking); err != nil {
-				return nil, fmt.Errorf("error Unmarshal thinking: %w", err)
+		if !preserveSuffix {
+			if err := mergeEffortSuffix(info.UpstreamModelName); err != nil {
+				return nil, kitreasoning.AsClientError(err)
 			}
-
-			// 只有当 thinking.Type 是 "enabled" 时才处理
-			if thinking.Type == "enabled" {
-				// 检查 BudgetTokens 是否为 nil
-				if thinking.BudgetTokens == nil {
-					return nil, fmt.Errorf("BudgetTokens is nil when thinking is enabled")
-				}
-
-				reasoning := openrouter.RequestReasoning{
-					MaxTokens: *thinking.BudgetTokens,
-				}
-
-				marshal, err := common.Marshal(reasoning)
-				if err != nil {
-					return nil, fmt.Errorf("error marshalling reasoning: %w", err)
-				}
-
-				request.Reasoning = marshal
+			if _, baseModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.UpstreamModelName); baseModel != info.UpstreamModelName {
+				info.UpstreamModelName = baseModel
+				request.Model = baseModel
 			}
-
-			// 清空 THINKING
-			request.THINKING = nil
+			if info.OriginModelName != info.UpstreamModelName {
+				if err := mergeEffortSuffix(info.OriginModelName); err != nil {
+					return nil, kitreasoning.AsClientError(err)
+				}
+			}
 		}
+		if !initialIntent.IsEmpty() {
+			reasoningConfig := make(map[string]any)
+			if len(request.Reasoning) > 0 {
+				if err := common.Unmarshal(request.Reasoning, &reasoningConfig); err != nil {
+					return nil, fmt.Errorf("error unmarshalling reasoning: %w", err)
+				}
+				if reasoningConfig == nil {
+					reasoningConfig = make(map[string]any)
+				}
+			}
+			disabled := initialIntent.Mode == kitreasoning.ModeDisabled || initialIntent.Effort == kitreasoning.EffortNone
+			if initialIntent.HasStrength() {
+				reasoningConfig["enabled"] = !disabled
+				if disabled {
+					delete(reasoningConfig, "effort")
+					delete(reasoningConfig, "max_tokens")
+				}
+			}
+			if !disabled && initialIntent.BudgetTokens != nil {
+				reasoningConfig["max_tokens"] = *initialIntent.BudgetTokens
+				delete(reasoningConfig, "effort")
+			} else if !disabled && initialIntent.Effort != "" && initialIntent.Effort != kitreasoning.EffortNone {
+				reasoningConfig["effort"] = string(initialIntent.Effort)
+				delete(reasoningConfig, "max_tokens")
+			}
+			if initialIntent.IncludeThoughts != nil {
+				reasoningConfig["exclude"] = !*initialIntent.IncludeThoughts
+			}
+			marshal, err := common.Marshal(reasoningConfig)
+			if err != nil {
+				return nil, fmt.Errorf("error marshalling reasoning: %w", err)
+			}
+			request.Reasoning = marshal
+		}
+		request.ReasoningEffort = ""
+		effectiveEffort := kitreasoning.EffectiveEffort(initialIntent)
+		if initialIntent.BudgetTokens != nil {
+			effectiveEffort = kitreasoning.EffortFromBudget(*initialIntent.BudgetTokens)
+		}
+		info.SetReasoningEffort(string(effectiveEffort))
 
 	}
-	if strings.HasPrefix(info.UpstreamModelName, "o") || strings.HasPrefix(info.UpstreamModelName, "gpt-5") {
-		if request.MaxCompletionTokens == 0 && request.MaxTokens != 0 {
-			request.MaxCompletionTokens = request.MaxTokens
-			request.MaxTokens = 0
+	if info.ChannelType != constant.ChannelTypeOpenRouter && renderReasoning {
+		effort, baseModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.UpstreamModelName)
+		if preserveSuffix {
+			effort = ""
 		}
-
-		if strings.HasPrefix(info.UpstreamModelName, "o") {
-			request.Temperature = nil
+		currentIntent, err := kitreasoning.FromOpenAIChat(request)
+		if err != nil {
+			return nil, kitreasoning.AsClientError(err)
 		}
-
-		// gpt-5系列模型适配 归零不再支持的参数
-		if strings.HasPrefix(info.UpstreamModelName, "gpt-5") {
-			request.Temperature = nil
-			request.TopP = 0 // oai 的 top_p 默认值是 1.0，但是为了 omitempty 属性直接不传，这里显式设置为 0
-			request.LogProbs = false
+		mergeSuffix := func(modelName, rawEffort string) error {
+			if rawEffort == "" {
+				return nil
+			}
+			suffixEffort, err := kitreasoning.ParseEffort(rawEffort)
+			if err != nil {
+				return err
+			}
+			mode := kitreasoning.ModeEnabled
+			if suffixEffort == kitreasoning.EffortNone {
+				mode = kitreasoning.ModeDisabled
+			}
+			currentIntent, err = kitreasoning.MergeExplicitAndSuffix(currentIntent, kitreasoning.Intent{Mode: mode, Effort: suffixEffort, Source: kitreasoning.SourceSuffix}, modelName)
+			return err
 		}
-
-		// 转换模型推理力度后缀
-		effort, originModel := parseReasoningEffortFromModelSuffix(info.UpstreamModelName)
-		if effort != "" {
-			request.ReasoningEffort = effort
-			info.UpstreamModelName = originModel
-			request.Model = originModel
+		if err := mergeSuffix(info.UpstreamModelName, effort); err != nil {
+			return nil, kitreasoning.AsClientError(err)
 		}
-
-		info.ReasoningEffort = request.ReasoningEffort
-
-		// o系列模型developer适配（o1-mini除外）
-		if !strings.HasPrefix(info.UpstreamModelName, "o1-mini") && !strings.HasPrefix(info.UpstreamModelName, "o1-preview") {
-			//修改第一个Message的内容，将system改为developer
-			if len(request.Messages) > 0 && request.Messages[0].Role == "system" {
-				request.Messages[0].Role = "developer"
+		if !preserveSuffix && info.OriginModelName != info.UpstreamModelName {
+			originEffort, _ := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.OriginModelName)
+			if err := mergeSuffix(info.OriginModelName, originEffort); err != nil {
+				return nil, kitreasoning.AsClientError(err)
 			}
 		}
+		if effort != "" {
+			info.UpstreamModelName = baseModel
+			request.Model = baseModel
+		}
+		if canonicalEffort := kitreasoning.EffectiveEffort(currentIntent); canonicalEffort != "" {
+			request.ReasoningEffort = string(canonicalEffort)
+			info.SetReasoningEffort(string(canonicalEffort))
+		}
+		if info.ChannelType == constant.ChannelTypeOpenAI || info.ChannelType == constant.ChannelTypeAzure {
+			request.Reasoning = nil
+		}
+	}
+
+	capabilities := dto.GetOpenAIChatCapabilities(info.UpstreamModelName, info.ReasoningEffort)
+	if capabilities.UseMaxCompletionTokens {
+		if lo.FromPtrOr(request.MaxCompletionTokens, uint(0)) == 0 && lo.FromPtrOr(request.MaxTokens, uint(0)) != 0 {
+			request.MaxCompletionTokens = request.MaxTokens
+			request.MaxTokens = nil
+		}
+	}
+	if !capabilities.SupportsTemperature {
+		request.Temperature = nil
+	}
+	if !capabilities.SupportsTopP {
+		request.TopP = nil
+	}
+	if !capabilities.SupportsLogProbs {
+		request.LogProbs = nil
+		request.TopLogProbs = nil
+	}
+	if capabilities.UseDeveloperRole && len(request.Messages) > 0 && request.Messages[0].Role == "system" {
+		request.Messages[0].Role = "developer"
 	}
 
 	return request, nil
@@ -346,7 +438,7 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
 	a.ResponseFormat = request.ResponseFormat
 	if info.RelayMode == relayconstant.RelayModeAudioSpeech {
-		jsonData, err := json.Marshal(request)
+		jsonData, err := common.Marshal(request)
 		if err != nil {
 			return nil, fmt.Errorf("error marshalling object: %w", err)
 		}
@@ -363,7 +455,7 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 		}
 
 		// 打印类似 curl 命令格式的信息
-		logger.LogDebug(c.Request.Context(), fmt.Sprintf("--form 'model=\"%s\"'", request.Model))
+		logger.LogDebug(c.Request.Context(), "--form 'model=\"%s\"'", request.Model)
 
 		// 遍历表单字段并打印输出
 		for key, values := range formData.Value {
@@ -372,7 +464,7 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 			}
 			for _, value := range values {
 				writer.WriteField(key, value)
-				logger.LogDebug(c.Request.Context(), fmt.Sprintf("--form '%s=\"%s\"'", key, value))
+				logger.LogDebug(c.Request.Context(), "--form '%s=\"%s\"'", key, value)
 			}
 		}
 
@@ -384,8 +476,8 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 
 		// 使用 formData 中的第一个文件
 		fileHeader := fileHeaders[0]
-		logger.LogDebug(c.Request.Context(), fmt.Sprintf("--form 'file=@\"%s\"' (size: %d bytes, content-type: %s)",
-			fileHeader.Filename, fileHeader.Size, fileHeader.Header.Get("Content-Type")))
+		logger.LogDebug(c.Request.Context(), "--form 'file=@\"%s\"' (size: %d bytes, content-type: %s)",
+			fileHeader.Filename, fileHeader.Size, fileHeader.Header.Get("Content-Type"))
 
 		file, err := fileHeader.Open()
 		if err != nil {
@@ -404,7 +496,7 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 		// 关闭 multipart 编写器以设置分界线
 		writer.Close()
 		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
-		logger.LogDebug(c.Request.Context(), fmt.Sprintf("--header 'Content-Type: %s'", writer.FormDataContentType()))
+		logger.LogDebug(c.Request.Context(), "--header 'Content-Type: %s'", writer.FormDataContentType())
 		return &requestBody, nil
 	}
 }
@@ -412,6 +504,9 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
 	switch info.RelayMode {
 	case relayconstant.RelayModeImagesEdits:
+		if isJSONRequest(c) {
+			return request, nil
+		}
 
 		var requestBody bytes.Buffer
 		writer := multipart.NewWriter(&requestBody)
@@ -420,10 +515,13 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 		// 使用已解析的 multipart 表单，避免重复解析
 		mf := c.Request.MultipartForm
 		if mf == nil {
-			if _, err := c.MultipartForm(); err != nil {
-				return nil, errors.New("failed to parse multipart form")
+			form, err := common.ParseMultipartFormReusable(c)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse multipart form: %w", err)
 			}
-			mf = c.Request.MultipartForm
+			c.Request.MultipartForm = form
+			c.Request.PostForm = url.Values(form.Value)
+			mf = form
 		}
 
 		// 写入所有非文件字段
@@ -537,6 +635,13 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 	}
 }
 
+func isJSONRequest(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	return strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json")
+}
+
 // detectImageMimeType determines the MIME type based on the file extension
 func detectImageMimeType(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
@@ -559,16 +664,68 @@ func detectImageMimeType(filename string) string {
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
 	//  转换模型推理力度后缀
-	effort, originModel := parseReasoningEffortFromModelSuffix(request.Model)
-	if effort != "" {
-		if request.Reasoning == nil {
-			request.Reasoning = &dto.Reasoning{
-				Effort: effort,
+	effort, originModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(request.Model)
+	preserveSuffix := model_setting.ShouldPreserveThinkingSuffix(request.Model) || (info != nil && model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName))
+	if preserveSuffix {
+		effort = ""
+	}
+	originEffort := ""
+	if info != nil && !preserveSuffix {
+		originEffort, _ = reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.OriginModelName)
+	}
+	crossProtocol := info != nil && len(info.RequestConversionChain) > 1
+	if (info == nil || info.ChannelType != constant.ChannelTypeOpenRouter) && !crossProtocol && effort == "" && originEffort == "" && request.ReasoningConversion == nil && info.ReasoningState() == nil {
+		if info != nil {
+			rawEffort := ""
+			if request.Reasoning != nil {
+				rawEffort = request.Reasoning.Effort
 			}
-		} else {
-			request.Reasoning.Effort = effort
+			info.SetReasoningEffort(rawEffort)
 		}
+		return request, nil
+	}
+	currentIntent, err := kitreasoning.FromOpenAIResponses(&request)
+	if err != nil {
+		return nil, kitreasoning.AsClientError(err)
+	}
+	mergeSuffix := func(modelName, rawEffort string) error {
+		if rawEffort == "" {
+			return nil
+		}
+		suffixEffort, err := kitreasoning.ParseEffort(rawEffort)
+		if err != nil {
+			return err
+		}
+		mode := kitreasoning.ModeEnabled
+		if suffixEffort == kitreasoning.EffortNone {
+			mode = kitreasoning.ModeDisabled
+		}
+		currentIntent, err = kitreasoning.MergeExplicitAndSuffix(currentIntent, kitreasoning.Intent{Mode: mode, Effort: suffixEffort, Source: kitreasoning.SourceSuffix}, modelName)
+		return err
+	}
+	if err := mergeSuffix(request.Model, effort); err != nil {
+		return nil, kitreasoning.AsClientError(err)
+	}
+	if !preserveSuffix && info != nil && info.OriginModelName != request.Model {
+		originEffort, _ := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.OriginModelName)
+		if err := mergeSuffix(info.OriginModelName, originEffort); err != nil {
+			return nil, kitreasoning.AsClientError(err)
+		}
+	}
+	if effort != "" {
 		request.Model = originModel
+		if info != nil {
+			info.UpstreamModelName = originModel
+		}
+	}
+	if canonicalEffort := kitreasoning.EffectiveEffort(currentIntent); canonicalEffort != "" {
+		if request.Reasoning == nil {
+			request.Reasoning = &dto.Reasoning{}
+		}
+		request.Reasoning.Effort = string(canonicalEffort)
+		if info != nil {
+			info.SetReasoningEffort(string(canonicalEffort))
+		}
 	}
 	return request, nil
 }
@@ -576,7 +733,7 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
 	if info.RelayMode == relayconstant.RelayModeAudioTranscription ||
 		info.RelayMode == relayconstant.RelayModeAudioTranslation ||
-		info.RelayMode == relayconstant.RelayModeImagesEdits {
+		(info.RelayMode == relayconstant.RelayModeImagesEdits && !isJSONRequest(c)) {
 		return channel.DoFormRequest(a, c, info, requestBody)
 	} else if info.RelayMode == relayconstant.RelayModeRealtime {
 		return channel.DoWssRequest(a, c, info, requestBody)
@@ -596,7 +753,11 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	case relayconstant.RelayModeAudioTranscription:
 		err, usage = OpenaiSTTHandler(c, resp, info, a.ResponseFormat)
 	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
-		usage, err = OpenaiHandlerWithUsage(c, info, resp)
+		if info.IsStream {
+			usage, err = OpenaiImageStreamHandler(c, info, resp)
+		} else {
+			usage, err = OpenaiImageHandler(c, info, resp)
+		}
 	case relayconstant.RelayModeRerank:
 		usage, err = common_handler.RerankHandler(c, info, resp)
 	case relayconstant.RelayModeResponses:
@@ -605,6 +766,8 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		} else {
 			usage, err = OaiResponsesHandler(c, info, resp)
 		}
+	case relayconstant.RelayModeResponsesCompact:
+		usage, err = OaiResponsesCompactionHandler(c, resp)
 	default:
 		if info.IsStream {
 			usage, err = OaiStreamHandler(c, info, resp)

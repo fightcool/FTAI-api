@@ -3,7 +3,7 @@ package zhipu_4v
 import (
 	"strings"
 
-	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 func requestOpenAI2Zhipu(request dto.GeneralOpenAIRequest) *dto.GeneralOpenAIRequest {
@@ -41,16 +41,20 @@ func requestOpenAI2Zhipu(request dto.GeneralOpenAIRequest) *dto.GeneralOpenAIReq
 	} else {
 		Stop, _ = request.Stop.([]string)
 	}
-	return &dto.GeneralOpenAIRequest{
+	out := &dto.GeneralOpenAIRequest{
 		Model:       request.Model,
 		Stream:      request.Stream,
 		Messages:    messages,
 		Temperature: request.Temperature,
 		TopP:        request.TopP,
-		MaxTokens:   request.GetMaxTokens(),
 		Stop:        Stop,
 		Tools:       request.Tools,
 		ToolChoice:  request.ToolChoice,
 		THINKING:    request.THINKING,
 	}
+	if request.MaxTokens != nil || request.MaxCompletionTokens != nil {
+		maxTokens := request.GetMaxTokens()
+		out.MaxTokens = &maxTokens
+	}
+	return out
 }

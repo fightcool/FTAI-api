@@ -14,14 +14,15 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/samber/lo"
 )
 
 type Adaptor struct {
@@ -35,7 +36,7 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 		return "", errors.New("replicate adaptor: relay info is nil")
 	}
 	if info.ChannelBaseUrl == "" {
-		info.ChannelBaseUrl = constant.ChannelBaseURLs[constant.ChannelTypeReplicate]
+		info.ChannelBaseUrl = constant.GetChannelBaseURL(constant.ChannelTypeReplicate)
 	}
 	requestPath := info.RequestURLPath
 	if requestPath == "" {
@@ -115,8 +116,8 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 		}
 	}
 
-	if request.N > 0 {
-		inputPayload["num_outputs"] = int(request.N)
+	if imageN := lo.FromPtrOr(request.N, uint(0)); imageN > 0 {
+		inputPayload["num_outputs"] = int(imageN)
 	}
 
 	if strings.EqualFold(request.Quality, "hd") || strings.EqualFold(request.Quality, "high") {
@@ -466,7 +467,7 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 
 	baseURL := info.ChannelBaseUrl
 	if baseURL == "" {
-		baseURL = constant.ChannelBaseURLs[constant.ChannelTypeReplicate]
+		baseURL = constant.GetChannelBaseURL(constant.ChannelTypeReplicate)
 	}
 	uploadURL := relaycommon.GetFullRequestURL(baseURL, "/v1/files", info.ChannelType)
 

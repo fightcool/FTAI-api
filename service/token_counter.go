@@ -3,11 +3,6 @@ package service
 import (
 	"errors"
 	"fmt"
-	"image"
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
-	"log"
 	"math"
 	"path/filepath"
 	"strings"
@@ -15,16 +10,17 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	constant2 "github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/gin-gonic/gin"
 )
 
-func getImageToken(fileMeta *types.FileMeta, model string, stream bool) (int, error) {
-	if fileMeta == nil {
+func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, stream bool) (int, error) {
+	if fileMeta == nil || fileMeta.Source == nil {
 		return 0, fmt.Errorf("image_url_is_nil")
 	}
 
@@ -99,40 +95,23 @@ func getImageToken(fileMeta *types.FileMeta, model string, stream bool) (int, er
 		fileMeta.Detail = "high"
 	}
 
-	// Decode image to get dimensions
-	var config image.Config
-	var err error
-	var format string
-	var b64str string
-
-	if fileMeta.ParsedData != nil {
-		config, format, b64str, err = DecodeBase64ImageData(fileMeta.ParsedData.Base64Data)
-	} else {
-		if strings.HasPrefix(fileMeta.OriginData, "http") {
-			config, format, err = DecodeUrlImageData(fileMeta.OriginData)
-		} else {
-			common.SysLog(fmt.Sprintf("decoding image"))
-			config, format, b64str, err = DecodeBase64ImageData(fileMeta.OriginData)
-		}
-		fileMeta.MimeType = format
-	}
-
+	// 使用统一的文件服务获取图片配置
+	config, format, err := GetImageConfig(c, fileMeta.Source)
 	if err != nil {
 		return 0, err
 	}
-
 	if config.Width == 0 || config.Height == 0 {
-		// not an image
-		if format != "" && b64str != "" {
+		// not an image, but might be a valid file
+		if format != "" {
 			// file type
 			return 3 * baseTokens, nil
 		}
-		return 0, errors.New(fmt.Sprintf("fail to decode base64 config: %s", fileMeta.OriginData))
+		return 0, errors.New(fmt.Sprintf("fail to decode image config: %s", fileMeta.GetIdentifier()))
 	}
 
 	width := config.Width
 	height := config.Height
-	log.Printf("format: %s, width: %d, height: %d", format, width, height)
+	logger.LogDebug(c, "image token input: format=%s, width=%d, height=%d", format, width, height)
 
 	if isPatchBased {
 		// 32x32 patch-based calculation with 1536 cap and model multiplier
@@ -157,15 +136,12 @@ func getImageToken(fileMeta *types.FileMeta, model string, stream bool) (int, er
 			hScaled = float64(height) * r
 			patchesW := math.Ceil(wScaled / 32.0)
 			patchesH := math.Ceil(hScaled / 32.0)
-			imageTokens := int(patchesW * patchesH)
-			if imageTokens > 1536 {
-				imageTokens = 1536
-			}
-			return int(math.Round(float64(imageTokens) * multiplier)), nil
+			imageTokens := min(int(patchesW*patchesH), 1536)
+			return common.QuotaRound(float64(imageTokens) * multiplier), nil
 		}
 		// below cap
 		imageTokens := rawPatches
-		return int(math.Round(float64(imageTokens) * multiplier)), nil
+		return common.QuotaRound(float64(imageTokens) * multiplier), nil
 	}
 
 	// Tile-based calculation for 4o/4.1/4.5/o1/o3/etc.
@@ -192,9 +168,7 @@ func getImageToken(fileMeta *types.FileMeta, model string, stream bool) (int, er
 	tilesH := (finalH + 512 - 1) / 512
 	tiles := tilesW * tilesH
 
-	if common.DebugEnabled {
-		log.Printf("scaled to: %dx%d, tiles: %d", finalW, finalH, tiles)
-	}
+	logger.LogDebug(c, "image token scaled size: width=%d, height=%d, tiles=%d", finalW, finalH, tiles)
 
 	return tiles*tileTokens + baseTokens, nil
 }
@@ -204,7 +178,13 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 	if !constant.CountToken {
 		return 0, nil
 	}
+	return CountRequestToken(c, meta, info)
+}
 
+// CountRequestToken counts request tokens regardless of the billing estimation
+// switch. Utility endpoints such as Claude's messages/count_tokens must remain
+// available even when operators disable request-token estimation for relays.
+func CountRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (int, error) {
 	if meta == nil {
 		return 0, errors.New("token count meta is nil")
 	}
@@ -231,8 +211,13 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 			if err != nil {
 				return 0, fmt.Errorf("error getting audio duration: %v", err)
 			}
-			// 一分钟 1000 token，与 $price / minute 对齐
-			totalAudioToken += int(math.Round(math.Ceil(duration) / 60.0 * 1000))
+			// duration 来自用户上传文件的元数据，可被伪造成天文数字或负数。
+			// 负值会让 token 估算变成负数（低估预扣费），先钳到 0 再转换。
+			if duration < 0 {
+				duration = 0
+			}
+			// 一分钟 1000 token，与 $price / minute 对齐。
+			totalAudioToken += common.QuotaRound(math.Ceil(duration) / 60.0 * 1000)
 		}
 		return totalAudioToken, nil
 	}
@@ -269,48 +254,25 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 		shouldFetchFiles = false
 	}
 
+	// 使用统一的文件服务获取文件类型
 	for _, file := range meta.Files {
-		if strings.HasPrefix(file.OriginData, "http") {
-			if shouldFetchFiles {
-				mineType, err := GetFileTypeFromUrl(c, file.OriginData, "token_counter")
-				if err != nil {
-					return 0, fmt.Errorf("error getting file base64 from url: %v", err)
+		if file.Source == nil {
+			continue
+		}
+
+		// 如果文件类型未知且需要获取，通过 MIME 类型检测
+		if file.FileType == "" || (file.Source.IsURL() && shouldFetchFiles) {
+			// 注意：这里我们直接调用 LoadFileSource 而不是 GetMimeType
+			// 因为 GetMimeType 内部可能会调用 GetFileTypeFromUrl (HEAD 请求)
+			// 而我们这里既然要计算 token，通常需要完整数据
+			cachedData, err := LoadFileSource(c, file.Source, "token_counter")
+			if err != nil {
+				if shouldFetchFiles {
+					return 0, fmt.Errorf("error getting file type: %v", err)
 				}
-				if strings.HasPrefix(mineType, "image/") {
-					file.FileType = types.FileTypeImage
-				} else if strings.HasPrefix(mineType, "video/") {
-					file.FileType = types.FileTypeVideo
-				} else if strings.HasPrefix(mineType, "audio/") {
-					file.FileType = types.FileTypeAudio
-				} else {
-					file.FileType = types.FileTypeFile
-				}
-				file.MimeType = mineType
+				continue
 			}
-		} else if strings.HasPrefix(file.OriginData, "data:") {
-			// get mime type from base64 header
-			parts := strings.SplitN(file.OriginData, ",", 2)
-			if len(parts) >= 1 {
-				header := parts[0]
-				// Extract mime type from "data:mime/type;base64" format
-				if strings.Contains(header, ":") && strings.Contains(header, ";") {
-					mimeStart := strings.Index(header, ":") + 1
-					mimeEnd := strings.Index(header, ";")
-					if mimeStart < mimeEnd {
-						mineType := header[mimeStart:mimeEnd]
-						if strings.HasPrefix(mineType, "image/") {
-							file.FileType = types.FileTypeImage
-						} else if strings.HasPrefix(mineType, "video/") {
-							file.FileType = types.FileTypeVideo
-						} else if strings.HasPrefix(mineType, "audio/") {
-							file.FileType = types.FileTypeAudio
-						} else {
-							file.FileType = types.FileTypeFile
-						}
-						file.MimeType = mineType
-					}
-				}
-			}
+			file.FileType = DetectFileType(cachedData.MimeType)
 		}
 	}
 
@@ -318,9 +280,9 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 		switch file.FileType {
 		case types.FileTypeImage:
 			if common.IsOpenAITextModel(model) {
-				token, err := getImageToken(file, model, info.IsStream)
+				token, err := getImageToken(c, file, model, info.IsStream)
 				if err != nil {
-					return 0, fmt.Errorf("error counting image token, media index[%d], original data[%s], err: %v", i, file.OriginData, err)
+					return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
 				}
 				tkm += token
 			} else {
@@ -400,17 +362,17 @@ func CountTokenInput(input any, model string) int {
 	case string:
 		return CountTextToken(v, model)
 	case []string:
-		text := ""
+		var text strings.Builder
 		for _, s := range v {
-			text += s
+			text.WriteString(s)
 		}
-		return CountTextToken(text, model)
-	case []interface{}:
-		text := ""
+		return CountTextToken(text.String(), model)
+	case []any:
+		var text strings.Builder
 		for _, item := range v {
-			text += fmt.Sprintf("%v", item)
+			text.WriteString(fmt.Sprintf("%v", item))
 		}
-		return CountTextToken(text, model)
+		return CountTextToken(text.String(), model)
 	}
 	return CountTokenInput(fmt.Sprintf("%v", input), model)
 }
@@ -423,7 +385,8 @@ func CountAudioTokenInput(audioBase64 string, audioFormat string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return int(duration / 60 * 100 / 0.06), nil
+	// duration 来自用户提供的音频元数据，饱和转换防止 int 回绕
+	return common.QuotaFromFloat(duration / 60 * 100 / 0.06), nil
 }
 
 func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) {
@@ -434,7 +397,8 @@ func CountAudioTokenOutput(audioBase64 string, audioFormat string) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	return int(duration / 60 * 200 / 0.24), nil
+	// duration 来自上游返回的音频元数据，饱和转换防止 int 回绕
+	return common.QuotaFromFloat(duration / 60 * 200 / 0.24), nil
 }
 
 // CountTextToken 统计文本的token数量，仅OpenAI模型使用tokenizer，其余模型使用估算

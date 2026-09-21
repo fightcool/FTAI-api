@@ -5,18 +5,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/QuantumNous/new-api/types"
 
 	"github.com/shopspring/decimal"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
@@ -45,6 +52,25 @@ type OpenAICreditGrants struct {
 	TotalGranted   float64 `json:"total_granted"`
 	TotalUsed      float64 `json:"total_used"`
 	TotalAvailable float64 `json:"total_available"`
+}
+
+const maxAdvancedCustomBalanceResponseBytes = 256 << 10
+
+type channelBalanceResult struct {
+	Balance     float64
+	RawResponse string
+	Usage       *usageQueryDetails
+}
+
+// usageQueryDetails carries the facts extracted by a usage query template in
+// the upstream's own currency; balance storage converts to USD separately.
+type usageQueryDetails struct {
+	Balance   float64 `json:"balance"`
+	Remaining float64 `json:"remaining"`
+	Used      float64 `json:"used"`
+	Currency  string  `json:"currency"`
+	Scope     string  `json:"scope"`
+	Available *bool   `json:"available,omitempty"`
 }
 
 type OpenAIUsageResponse struct {
@@ -144,7 +170,7 @@ func GetResponseBody(method, url string, channel *model.Channel, headers http.He
 	for k := range headers {
 		req.Header.Add(k, headers.Get(k))
 	}
-	client, err := service.NewProxyHttpClient(channel.GetSetting().Proxy)
+	client, err := service.GetHttpClientWithProxy(channel.GetSetting().Proxy)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +200,7 @@ func updateChannelCloseAIBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	response := OpenAICreditGrants{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -189,7 +215,7 @@ func updateChannelOpenAISBBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	response := OpenAISBUsageResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -213,7 +239,7 @@ func updateChannelAIProxyBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	response := AIProxyUserOverviewResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -232,7 +258,7 @@ func updateChannelAPI2GPTBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	response := API2GPTUsageResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -247,7 +273,7 @@ func updateChannelSiliconFlowBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	response := SiliconFlowUsageResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -263,13 +289,13 @@ func updateChannelSiliconFlowBalance(channel *model.Channel) (float64, error) {
 }
 
 func updateChannelDeepSeekBalance(channel *model.Channel) (float64, error) {
-	url := "https://api.deepseek.com/user/balance"
+	url := fmt.Sprintf("%s/user/balance", strings.TrimRight(channel.GetBaseURL(), "/"))
 	body, err := GetResponseBody("GET", url, channel, GetAuthHeader(channel.Key))
 	if err != nil {
 		return 0, err
 	}
 	response := DeepSeekUsageResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -287,6 +313,8 @@ func updateChannelDeepSeekBalance(channel *model.Channel) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// DeepSeek reports CNY; channel balance is stored in the USD convention.
+	balance = convertCNYToUSD(balance)
 	channel.UpdateBalance(balance)
 	return balance, nil
 }
@@ -298,7 +326,7 @@ func updateChannelAIGC2DBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	response := APGC2DGPTUsageResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -313,7 +341,7 @@ func updateChannelOpenRouterBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	response := OpenRouterCreditResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -343,7 +371,7 @@ func updateChannelMoonshotBalance(channel *model.Channel) (float64, error) {
 	}
 
 	response := MoonshotBalanceResponse{}
-	err = json.Unmarshal(body, &response)
+	err = common.Unmarshal(body, &response)
 	if err != nil {
 		return 0, err
 	}
@@ -356,8 +384,264 @@ func updateChannelMoonshotBalance(channel *model.Channel) (float64, error) {
 	return availableBalanceUsd, nil
 }
 
-func updateChannelBalance(channel *model.Channel) (float64, error) {
-	baseURL := constant.ChannelBaseURLs[channel.Type]
+func fetchAdvancedCustomBalance(channel *model.Channel) (channelBalanceResult, error) {
+	key := strings.TrimSpace(channel.Key)
+	info := &relaycommon.RelayInfo{
+		RelayFormat:    types.RelayFormatOpenAI,
+		RelayMode:      relayconstant.RelayModeUnknown,
+		RequestURLPath: dto.AdvancedCustomBalancePath,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:          constant.ChannelTypeAdvancedCustom,
+			ChannelBaseUrl:       channel.GetBaseURL(),
+			ApiKey:               key,
+			ChannelOtherSettings: channel.GetOtherSettings(),
+		},
+	}
+	requestURL, headers, err := (&advancedcustom.Adaptor{}).BuildBalanceRequest(info)
+	if err != nil {
+		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+	}
+	if err := applyFetchModelsHeaderOverrides(channel, key, headers); err != nil {
+		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+	}
+	for name, values := range headers {
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+		if strings.EqualFold(name, "Host") {
+			request.Host = headers.Get(name)
+		}
+	}
+	client, err := service.GetHttpClientWithProxy(channel.GetSetting().Proxy)
+	if err != nil {
+		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return channelBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return channelBalanceResult{}, fmt.Errorf("status code: %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxAdvancedCustomBalanceResponseBytes+1))
+	if err != nil {
+		return channelBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
+	}
+	if len(body) > maxAdvancedCustomBalanceResponseBytes {
+		return channelBalanceResult{}, fmt.Errorf("balance response exceeds %d bytes", maxAdvancedCustomBalanceResponseBytes)
+	}
+
+	var validated json.RawMessage
+	if err := common.Unmarshal(body, &validated); err != nil {
+		return channelBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
+	}
+	if common.GetJsonType(validated) == "object" {
+		var creditSummary struct {
+			Object         string          `json:"object"`
+			TotalAvailable json.RawMessage `json:"total_available"`
+		}
+		if err := common.Unmarshal(body, &creditSummary); err != nil {
+			return channelBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
+		}
+		if creditSummary.Object == "credit_summary" &&
+			common.GetJsonType(creditSummary.TotalAvailable) == "number" {
+			var balance float64
+			if err := common.Unmarshal(creditSummary.TotalAvailable, &balance); err == nil &&
+				balance >= 0 &&
+				!math.IsNaN(balance) &&
+				!math.IsInf(balance, 0) {
+				channel.UpdateBalance(balance)
+				return channelBalanceResult{Balance: balance}, nil
+			}
+		}
+	}
+
+	formatted, err := common.IndentJson(body)
+	if err != nil {
+		return channelBalanceResult{}, fmt.Errorf("invalid balance JSON response: %w", err)
+	}
+	return channelBalanceResult{RawResponse: string(formatted)}, nil
+}
+
+// convertCNYToUSD converts an upstream CNY amount to the USD storage
+// convention using the admin-configured exchange rate.
+func convertCNYToUSD(value float64) float64 {
+	rate := operation_setting.USDExchangeRate
+	if rate <= 0 {
+		common.SysError("USDExchangeRate is not positive; usage balance kept without CNY conversion")
+		return value
+	}
+	return value / rate
+}
+
+// fetchUsageTemplateBalance queries the upstream usage/balance endpoint
+// described by the channel's usage_query_template and stores the USD balance.
+func fetchUsageTemplateBalance(channel *model.Channel, template *dto.ChannelUsageQueryTemplate) (channelBalanceResult, error) {
+	key := strings.TrimSpace(channel.Key)
+	baseURL := strings.TrimRight(channel.GetBaseURL(), "/")
+	if baseURL == "" && strings.Contains(template.URL, dto.UsageQueryURLPlaceholder) {
+		return channelBalanceResult{}, errors.New("usage query template requires a channel base URL")
+	}
+	requestURL := strings.ReplaceAll(template.URL, dto.UsageQueryURLPlaceholder, baseURL)
+
+	method := strings.ToUpper(strings.TrimSpace(template.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if method != http.MethodGet && method != http.MethodPost {
+		return channelBalanceResult{}, fmt.Errorf("unsupported usage query method: %s", template.Method)
+	}
+
+	headers := GetAuthHeader(key)
+	if err := applyFetchModelsHeaderOverrides(channel, key, headers); err != nil {
+		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+	}
+	request, err := http.NewRequest(method, requestURL, nil)
+	if err != nil {
+		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+	}
+	for name, values := range headers {
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+		if strings.EqualFold(name, "Host") {
+			request.Host = headers.Get(name)
+		}
+	}
+	client, err := service.GetHttpClientWithProxy(channel.GetSetting().Proxy)
+	if err != nil {
+		return channelBalanceResult{}, sanitizeFetchModelsError(err, key)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return channelBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return channelBalanceResult{}, fmt.Errorf("status code: %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxAdvancedCustomBalanceResponseBytes+1))
+	if err != nil {
+		return channelBalanceResult{}, sanitizeAdvancedCustomRequestError(err, key, requestURL)
+	}
+	if len(body) > maxAdvancedCustomBalanceResponseBytes {
+		return channelBalanceResult{}, fmt.Errorf("usage query response exceeds %d bytes", maxAdvancedCustomBalanceResponseBytes)
+	}
+	var validated json.RawMessage
+	if err := common.Unmarshal(body, &validated); err != nil {
+		return channelBalanceResult{}, fmt.Errorf("invalid usage query JSON response: %w", err)
+	}
+
+	details, storeValue, ok := parseUsageTemplateResponse(body, template)
+	if !ok {
+		formatted, err := common.IndentJson(body)
+		if err != nil {
+			return channelBalanceResult{}, fmt.Errorf("invalid usage query JSON response: %w", err)
+		}
+		return channelBalanceResult{RawResponse: string(formatted)}, nil
+	}
+	details.Currency = usageTemplateCurrency(body, template)
+	if details.Currency == "CNY" {
+		storeValue = convertCNYToUSD(storeValue)
+	}
+	channel.UpdateBalance(storeValue)
+	return channelBalanceResult{Balance: storeValue, Usage: &details}, nil
+}
+
+// parseUsageTemplateResponse extracts usage/balance facts from an upstream
+// JSON body via the template's gjson dot paths. storeValue is the upstream
+// currency amount to store (remaining preferred, balance fallback); ok is
+// false when neither remaining nor balance parsed.
+func parseUsageTemplateResponse(body []byte, template *dto.ChannelUsageQueryTemplate) (details usageQueryDetails, storeValue float64, ok bool) {
+	if value, found := usageTemplateNumber(body, template.Mapping.Remaining); found {
+		details.Remaining = value
+		storeValue = value
+		ok = true
+	}
+	if value, found := usageTemplateNumber(body, template.Mapping.Balance); found {
+		details.Balance = value
+		if !ok {
+			storeValue = value
+			ok = true
+		}
+	}
+	if value, found := usageTemplateNumber(body, template.Mapping.Used); found {
+		details.Used = value
+	}
+	if path := strings.TrimSpace(template.Mapping.Scope); path != "" {
+		if result := gjson.GetBytes(body, path); result.Exists() {
+			details.Scope = result.String()
+		}
+	}
+	if path := strings.TrimSpace(template.Mapping.Available); path != "" {
+		if result := gjson.GetBytes(body, path); result.Exists() {
+			available := result.Bool()
+			details.Available = &available
+		}
+	}
+	return details, storeValue, ok
+}
+
+func usageTemplateNumber(body []byte, path string) (float64, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return 0, false
+	}
+	result := gjson.GetBytes(body, path)
+	if !result.Exists() {
+		return 0, false
+	}
+	var value float64
+	if result.Type == gjson.Number {
+		value = result.Float()
+	} else {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(result.String()), 64)
+		if err != nil {
+			return 0, false
+		}
+		value = parsed
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	return value, true
+}
+
+// usageTemplateCurrency resolves the upstream currency: mapping.currency wins
+// when it yields USD/CNY, otherwise the template unit, defaulting to USD.
+func usageTemplateCurrency(body []byte, template *dto.ChannelUsageQueryTemplate) string {
+	if path := strings.TrimSpace(template.Mapping.Currency); path != "" {
+		if result := gjson.GetBytes(body, path); result.Exists() {
+			if currency := strings.ToUpper(strings.TrimSpace(result.String())); currency == "USD" || currency == "CNY" {
+				return currency
+			}
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(template.Unit), "CNY") {
+		return "CNY"
+	}
+	return "USD"
+}
+
+func updateChannelBalance(channel *model.Channel) (channelBalanceResult, error) {
+	if template := channel.GetOtherSettings().UsageQueryTemplate; template != nil {
+		return fetchUsageTemplateBalance(channel, template)
+	}
+	if channel.Type == constant.ChannelTypeAdvancedCustom {
+		return fetchAdvancedCustomBalance(channel)
+	}
+	balance, err := updateStandardChannelBalance(channel)
+	return channelBalanceResult{Balance: balance}, err
+}
+
+func updateStandardChannelBalance(channel *model.Channel) (float64, error) {
+	baseURL := constant.GetChannelBaseURL(channel.Type)
 	if channel.GetBaseURL() == "" {
 		channel.BaseURL = &baseURL
 	}
@@ -396,7 +680,7 @@ func updateChannelBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	subscription := OpenAISubscriptionResponse{}
-	err = json.Unmarshal(body, &subscription)
+	err = common.Unmarshal(body, &subscription)
 	if err != nil {
 		return 0, err
 	}
@@ -412,7 +696,7 @@ func updateChannelBalance(channel *model.Channel) (float64, error) {
 		return 0, err
 	}
 	usage := OpenAIUsageResponse{}
-	err = json.Unmarshal(body, &usage)
+	err = common.Unmarshal(body, &usage)
 	if err != nil {
 		return 0, err
 	}
@@ -432,6 +716,10 @@ func UpdateChannelBalance(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if channel.Type == constant.ChannelTypeTaskPlugin {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "Task Plugin channels do not support balance queries"})
+		return
+	}
 	if channel.ChannelInfo.IsMultiKey {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -439,16 +727,24 @@ func UpdateChannelBalance(c *gin.Context) {
 		})
 		return
 	}
-	balance, err := updateChannelBalance(channel)
+	result, err := updateChannelBalance(channel)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"success": true,
 		"message": "",
-		"balance": balance,
-	})
+	}
+	if result.RawResponse == "" {
+		response["balance"] = result.Balance
+		if result.Usage != nil {
+			response["usage"] = result.Usage
+		}
+	} else {
+		response["raw_response"] = result.RawResponse
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func updateAllChannelsBalance() error {
@@ -467,12 +763,12 @@ func updateAllChannelsBalance() error {
 		//if channel.Type != common.ChannelTypeOpenAI && channel.Type != common.ChannelTypeCustom {
 		//	continue
 		//}
-		balance, err := updateChannelBalance(channel)
+		result, err := updateChannelBalance(channel)
 		if err != nil {
 			continue
-		} else {
+		} else if result.RawResponse == "" {
 			// err is nil & balance <= 0 means quota is used up
-			if balance <= 0 {
+			if result.Balance <= 0 {
 				service.DisableChannel(*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, "", channel.GetAutoBan()), "余额不足")
 			}
 		}

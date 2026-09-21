@@ -1,276 +1,478 @@
 package controller
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"sort"
+	"regexp"
 	"strconv"
-	"time"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
-	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
-
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
-	"github.com/samber/lo"
 )
 
-func UpdateTaskBulk() {
-	//revocer
-	//imageModel := "midjourney"
-	for {
-		time.Sleep(time.Duration(15) * time.Second)
-		common.SysLog("任务进度轮询开始")
-		ctx := context.TODO()
-		allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
-		platformTask := make(map[constant.TaskPlatform][]*model.Task)
-		for _, t := range allTasks {
-			platformTask[t.Platform] = append(platformTask[t.Platform], t)
-		}
-		for platform, tasks := range platformTask {
-			if len(tasks) == 0 {
-				continue
-			}
-			taskChannelM := make(map[int][]string)
-			taskM := make(map[string]*model.Task)
-			nullTaskIds := make([]int64, 0)
-			for _, task := range tasks {
-				if task.TaskID == "" {
-					// 统计失败的未完成任务
-					nullTaskIds = append(nullTaskIds, task.ID)
-					continue
-				}
-				taskM[task.TaskID] = task
-				taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], task.TaskID)
-			}
-			if len(nullTaskIds) > 0 {
-				err := model.TaskBulkUpdateByID(nullTaskIds, map[string]any{
-					"status":   "FAILURE",
-					"progress": "100%",
-				})
-				if err != nil {
-					logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
-				} else {
-					logger.LogInfo(ctx, fmt.Sprintf("Fix null task_id task success: %v", nullTaskIds))
-				}
-			}
-			if len(taskChannelM) == 0 {
-				continue
-			}
-
-			UpdateTaskByPlatform(platform, taskChannelM, taskM)
-		}
-		common.SysLog("任务进度轮询完成")
-	}
+type taskArtifactResponse struct {
+	Key        string `json:"key"`
+	Type       string `json:"type"`
+	MimeType   string `json:"mime_type,omitempty"`
+	ContentURL string `json:"content_url"`
 }
 
-func UpdateTaskByPlatform(platform constant.TaskPlatform, taskChannelM map[int][]string, taskM map[string]*model.Task) {
-	switch platform {
-	case constant.TaskPlatformMidjourney:
-		//_ = UpdateMidjourneyTaskAll(context.Background(), tasks)
-	case constant.TaskPlatformSuno:
-		_ = UpdateSunoTaskAll(context.Background(), taskChannelM, taskM)
-	default:
-		if err := UpdateVideoTaskAll(context.Background(), platform, taskChannelM, taskM); err != nil {
-			common.SysLog(fmt.Sprintf("UpdateVideoTaskAll fail: %s", err))
-		}
-	}
-}
+var (
+	taskArtifactKeyPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$`)
+	errTaskArtifactPluginUnavailable = errors.New("task artifact plugin unavailable")
+	errTaskArtifactPlugin            = errors.New("task artifact plugin error")
+)
 
-func UpdateSunoTaskAll(ctx context.Context, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
-	for channelId, taskIds := range taskChannelM {
-		err := updateSunoTaskAll(ctx, channelId, taskIds, taskM)
-		if err != nil {
-			logger.LogError(ctx, fmt.Sprintf("渠道 #%d 更新异步任务失败: %s", channelId, err.Error()))
-		}
-	}
-	return nil
-}
-
-func updateSunoTaskAll(ctx context.Context, channelId int, taskIds []string, taskM map[string]*model.Task) error {
-	logger.LogInfo(ctx, fmt.Sprintf("渠道 #%d 未完成的任务有: %d", channelId, len(taskIds)))
-	if len(taskIds) == 0 {
-		return nil
-	}
-	channel, err := model.CacheGetChannel(channelId)
+func GetTask(c *gin.Context) {
+	task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("key"))
 	if err != nil {
-		common.SysLog(fmt.Sprintf("CacheGetChannel: %v", err))
-		err = model.TaskBulkUpdate(taskIds, map[string]any{
-			"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
-			"status":      "FAILURE",
-			"progress":    "100%",
+		videoProxyError(c, http.StatusInternalServerError, "server_error", "Failed to query task")
+		return
+	}
+	if !exists {
+		videoProxyError(c, http.StatusNotFound, "invalid_request_error", "Task not found")
+		return
+	}
+	createdAt := task.CreatedAt
+	if createdAt == 0 {
+		createdAt = task.SubmitTime
+	}
+	failReason := task.FailReason
+	if task.Status == model.TaskStatusSuccess && taskFailReasonIsLegacyResultURL(task.FailReason) {
+		failReason = ""
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"task_id":     task.TaskID,
+		"platform":    task.Platform,
+		"status":      task.Status,
+		"progress":    task.Progress,
+		"fail_reason": failReason,
+		"created_at":  createdAt,
+		"finished_at": task.FinishTime,
+	})
+}
+
+func GetTaskArtifacts(c *gin.Context) {
+	task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("key"))
+	if err != nil {
+		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
+		return
+	}
+	if !exists || task == nil {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return
+	}
+	writeTaskArtifacts(c, task, false)
+}
+
+func GetDashboardTaskArtifacts(c *gin.Context) {
+	task, exists, err := getTaskForArtifactRequest(c, c.Param("task_id"))
+	if err != nil {
+		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
+		return
+	}
+	if !exists || task == nil {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return
+	}
+	writeTaskArtifacts(c, task, true)
+}
+
+func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
+	c.Header("Cache-Control", "private, no-store")
+	artifacts, err := projectTaskArtifacts(task)
+	if err != nil {
+		writeTaskArtifactProjectionError(c, err)
+		return
+	}
+	items := make([]taskArtifactResponse, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		contentURL, buildErr := service.BuildTaskArtifactContentURL(task.TaskID, artifact.Key)
+		if buildErr != nil {
+			writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_url_error", "Failed to build artifact content URL")
+			return
+		}
+		items = append(items, taskArtifactResponse{
+			Key:        artifact.Key,
+			Type:       artifact.Type,
+			MimeType:   artifact.MimeType,
+			ContentURL: contentURL,
 		})
-		if err != nil {
-			common.SysLog(fmt.Sprintf("UpdateMidjourneyTask error2: %v", err))
-		}
-		return err
 	}
-	adaptor := relay.GetTaskAdaptor(constant.TaskPlatformSuno)
+	response := gin.H{"task_id": task.TaskID, "artifacts": items}
+	if legacyVideoAvailable(task) {
+		legacyContentURL, buildErr := service.BuildTaskArtifactContentURL(task.TaskID, "video")
+		if buildErr != nil {
+			writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_url_error", "Failed to build artifact content URL")
+			return
+		}
+		response["legacy_content_url"] = legacyContentURL
+	}
+	if dashboard {
+		common.ApiSuccess(c, response)
+		return
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func projectTaskArtifacts(task *model.Task) ([]relaychannel.TaskArtifact, error) {
+	if task == nil || task.Status != model.TaskStatusSuccess || !taskHasPluginExecution(task) {
+		return []relaychannel.TaskArtifact{}, nil
+	}
+	adaptor := relay.GetTaskAdaptor(task.Platform)
 	if adaptor == nil {
-		return errors.New("adaptor not found")
+		return nil, errTaskArtifactPluginUnavailable
 	}
-	proxy := channel.GetSetting().Proxy
-	resp, err := adaptor.FetchTask(*channel.BaseURL, channel.Key, map[string]any{
-		"ids": taskIds,
-	}, proxy)
+	provider, ok := adaptor.(relaychannel.TaskArtifactProvider)
+	if !ok {
+		return []relaychannel.TaskArtifact{}, nil
+	}
+	artifacts, err := provider.ListArtifacts(task)
 	if err != nil {
-		common.SysLog(fmt.Sprintf("Get Task Do req error: %v", err))
-		return err
+		return nil, fmt.Errorf("%w: %v", errTaskArtifactPlugin, err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		logger.LogError(ctx, fmt.Sprintf("Get Task status code: %d", resp.StatusCode))
-		return errors.New(fmt.Sprintf("Get Task status code: %d", resp.StatusCode))
-	}
-	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		common.SysLog(fmt.Sprintf("Get Task parse body error: %v", err))
-		return err
-	}
-	var responseItems dto.TaskResponse[[]dto.SunoDataResponse]
-	err = json.Unmarshal(responseBody, &responseItems)
-	if err != nil {
-		logger.LogError(ctx, fmt.Sprintf("Get Task parse body error2: %v, body: %s", err, string(responseBody)))
-		return err
-	}
-	if !responseItems.IsSuccess() {
-		common.SysLog(fmt.Sprintf("渠道 #%d 未完成的任务有: %d, 成功获取到任务数: %s", channelId, len(taskIds), string(responseBody)))
-		return err
-	}
-
-	for _, responseItem := range responseItems.Data {
-		task := taskM[responseItem.TaskID]
-		if !checkTaskNeedUpdate(task, responseItem) {
-			continue
-		}
-
-		task.Status = lo.If(model.TaskStatus(responseItem.Status) != "", model.TaskStatus(responseItem.Status)).Else(task.Status)
-		task.FailReason = lo.If(responseItem.FailReason != "", responseItem.FailReason).Else(task.FailReason)
-		task.SubmitTime = lo.If(responseItem.SubmitTime != 0, responseItem.SubmitTime).Else(task.SubmitTime)
-		task.StartTime = lo.If(responseItem.StartTime != 0, responseItem.StartTime).Else(task.StartTime)
-		task.FinishTime = lo.If(responseItem.FinishTime != 0, responseItem.FinishTime).Else(task.FinishTime)
-		if responseItem.FailReason != "" || task.Status == model.TaskStatusFailure {
-			logger.LogInfo(ctx, task.TaskID+" 构建失败，"+task.FailReason)
-			task.Progress = "100%"
-			//err = model.CacheUpdateUserQuota(task.UserId) ?
-			if err != nil {
-				logger.LogError(ctx, "error update user quota cache: "+err.Error())
-			} else {
-				quota := task.Quota
-				if quota != 0 {
-					err = model.IncreaseUserQuota(task.UserId, quota, false)
-					if err != nil {
-						logger.LogError(ctx, "fail to increase user quota: "+err.Error())
-					}
-					logContent := fmt.Sprintf("异步任务执行失败 %s，补偿 %s", task.TaskID, logger.LogQuota(quota))
-					model.RecordLog(task.UserId, model.LogTypeSystem, logContent)
-				}
-			}
-		}
-		if responseItem.Status == model.TaskStatusSuccess {
-			task.Progress = "100%"
-		}
-		task.Data = responseItem.Data
-
-		err = task.Update()
-		if err != nil {
-			common.SysLog("UpdateMidjourneyTask task error: " + err.Error())
-		}
-	}
-	return nil
+	return validateProjectedTaskArtifacts(artifacts)
 }
 
-func checkTaskNeedUpdate(oldTask *model.Task, newTask dto.SunoDataResponse) bool {
-
-	if oldTask.SubmitTime != newTask.SubmitTime {
-		return true
+func validateProjectedTaskArtifacts(artifacts []relaychannel.TaskArtifact) ([]relaychannel.TaskArtifact, error) {
+	if len(artifacts) > 64 {
+		return nil, fmt.Errorf("%w: too many artifacts", errTaskArtifactPlugin)
 	}
-	if oldTask.StartTime != newTask.StartTime {
-		return true
+	seen := make(map[string]struct{}, len(artifacts))
+	for i := range artifacts {
+		if artifacts[i].Key != strings.TrimSpace(artifacts[i].Key) ||
+			artifacts[i].Type != strings.TrimSpace(artifacts[i].Type) {
+			return nil, fmt.Errorf("%w: invalid artifact identity", errTaskArtifactPlugin)
+		}
+		if !taskArtifactKeyPattern.MatchString(artifacts[i].Key) {
+			return nil, fmt.Errorf("%w: invalid artifact key", errTaskArtifactPlugin)
+		}
+		if _, exists := seen[artifacts[i].Key]; exists {
+			return nil, fmt.Errorf("%w: duplicate artifact key", errTaskArtifactPlugin)
+		}
+		seen[artifacts[i].Key] = struct{}{}
+		switch artifacts[i].Type {
+		case "video", "audio", "image", "file":
+		default:
+			return nil, fmt.Errorf("%w: invalid artifact type", errTaskArtifactPlugin)
+		}
+		if len(artifacts[i].MimeType) > 255 || strings.ContainsAny(artifacts[i].MimeType, "\r\n") {
+			return nil, fmt.Errorf("%w: invalid artifact mime type", errTaskArtifactPlugin)
+		}
 	}
-	if oldTask.FinishTime != newTask.FinishTime {
-		return true
-	}
-	if string(oldTask.Status) != newTask.Status {
-		return true
-	}
-	if oldTask.FailReason != newTask.FailReason {
-		return true
-	}
-	if oldTask.FinishTime != newTask.FinishTime {
-		return true
-	}
-
-	if (oldTask.Status == model.TaskStatusFailure || oldTask.Status == model.TaskStatusSuccess) && oldTask.Progress != "100%" {
-		return true
-	}
-
-	oldData, _ := json.Marshal(oldTask.Data)
-	newData, _ := json.Marshal(newTask.Data)
-
-	sort.Slice(oldData, func(i, j int) bool {
-		return oldData[i] < oldData[j]
-	})
-	sort.Slice(newData, func(i, j int) bool {
-		return newData[i] < newData[j]
-	})
-
-	if string(oldData) != string(newData) {
-		return true
-	}
-	return false
+	return artifacts, nil
 }
+
+func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error) {
+	if task == nil || !taskHasPluginExecution(task) {
+		return nil, errTaskArtifactPluginUnavailable
+	}
+	channelModel, err := model.CacheGetChannel(task.ChannelId)
+	if err != nil {
+		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
+	}
+	adaptor := relay.GetTaskAdaptor(task.Platform)
+	if adaptor == nil {
+		return nil, errTaskArtifactPluginUnavailable
+	}
+	pluginKey := task.PrivateData.Key
+	if pluginKey == "" {
+		pluginKey = channelModel.Key
+	}
+	baseURL := channelModel.GetBaseURL()
+	if baseURL == "" {
+		baseURL = constant.GetChannelBaseURL(channelModel.Type)
+	}
+	adaptor.Init(&relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:    channelModel.Type,
+			ChannelBaseUrl: baseURL,
+			ApiKey:         pluginKey,
+			ChannelSetting: channelModel.GetSetting(),
+		},
+	})
+	return adaptor, nil
+}
+
+func taskHasPluginExecution(task *model.Task) bool {
+	return task != nil &&
+		task.PrivateData.Execution != nil &&
+		task.PrivateData.Execution.TaskPlugin != nil &&
+		strings.TrimSpace(task.PrivateData.Execution.TaskPlugin.Key) != ""
+}
+
+func legacyVideoAvailable(task *model.Task) bool {
+	if task == nil || task.Status != model.TaskStatusSuccess ||
+		taskHasPluginExecution(task) || task.Platform == constant.TaskPlatformSuno ||
+		strings.TrimSpace(task.GetResultURL()) == "" {
+		return false
+	}
+	switch constant.NormalizeTaskAction(task.Action) {
+	case constant.TaskActionImageToVideo,
+		constant.TaskActionTextToVideo,
+		constant.TaskActionFirstTailToVideo,
+		constant.TaskActionReferenceToVideo,
+		constant.TaskActionRemix:
+		return true
+	default:
+		return false
+	}
+}
+
+func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool, error) {
+	if middleware.IsTaskArtifactAccess(c) {
+		task, exists, err := model.GetUniqueByOnlyTaskId(taskID)
+		if err != nil || !exists || task == nil {
+			return task, exists, err
+		}
+		owner, err := model.GetUserCache(task.UserId)
+		if err != nil || owner == nil || owner.Status != common.UserStatusEnabled {
+			return nil, false, err
+		}
+		return task, true, nil
+	}
+	if c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser {
+		return model.GetByOnlyTaskId(taskID)
+	}
+	return model.GetByTaskId(c.GetInt("id"), taskID)
+}
+
+func writeTaskArtifactProjectionError(c *gin.Context, err error) {
+	if errors.Is(err, errTaskArtifactPluginUnavailable) {
+		writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_plugin_unavailable", "Artifact preview plugin is unavailable")
+		return
+	}
+	writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_plugin_error", "Artifact preview plugin failed")
+}
+
+func writeTaskArtifactError(c *gin.Context, status int, code, message string) {
+	c.Header("Cache-Control", "private, no-store")
+	if middleware.IsTaskArtifactAccess(c) {
+		status = http.StatusNotFound
+		code = "artifact_not_found"
+		message = "Task or artifact not found"
+	}
+	if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+		c.JSON(status, gin.H{"success": false, "code": code, "message": message})
+		return
+	}
+	c.JSON(status, gin.H{
+		"error": gin.H{
+			"message": message,
+			"type":    code,
+			"code":    code,
+		},
+	})
+}
+
+func TaskArtifactContent(c *gin.Context) {
+	task, exists, err := getTaskForArtifactRequest(c, c.Param("key"))
+	if err != nil {
+		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
+		return
+	}
+	if !exists || task == nil {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return
+	}
+	artifactKey := strings.TrimSpace(c.Param("artifact_key"))
+	if !taskArtifactKeyPattern.MatchString(artifactKey) {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return
+	}
+	if task.Status != model.TaskStatusSuccess {
+		writeTaskArtifactError(c, http.StatusConflict, "artifact_not_ready", "Task artifacts are not ready")
+		return
+	}
+	if !taskHasPluginExecution(task) {
+		if artifactKey != "video" || !legacyVideoAvailable(task) {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		descriptor := &relaychannel.TaskContentRequest{
+			URL:            task.GetResultURL(),
+			Method:         c.Request.Method,
+			Credentialless: true,
+		}
+		if err := proxyTaskMedia(c, task, descriptor); err != nil {
+			writeTaskMediaProxyError(c, err)
+		}
+		return
+	}
+	artifacts, err := projectTaskArtifacts(task)
+	if err != nil {
+		writeTaskArtifactProjectionError(c, err)
+		return
+	}
+	found := false
+	for _, artifact := range artifacts {
+		if artifact.Key == artifactKey {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		return
+	}
+	artifactStore := service.GetTaskArtifactStore()
+	if ref, resolveErr := artifactStore.Resolve(task, artifactKey); resolveErr == nil && ref != nil {
+		_ = artifactStore.Serve(c, task, ref)
+		return
+	}
+
+	adaptor, err := initTaskArtifactAdaptor(task)
+	if err != nil {
+		writeTaskArtifactProjectionError(c, err)
+		return
+	}
+	provider, ok := adaptor.(relaychannel.TaskContentRequestProvider)
+	if !ok {
+		writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_plugin_unavailable", "Artifact content plugin is unavailable")
+		return
+	}
+	clientRequest := relaychannel.TaskArtifactClientRequest{
+		Method:  c.Request.Method,
+		Headers: taskArtifactClientHeaders(c.Request.Header),
+	}
+	descriptor, err := provider.BuildContentRequest(task, artifactKey, clientRequest)
+	if err != nil || descriptor == nil {
+		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_plugin_error", "Artifact content plugin failed")
+		return
+	}
+	if err := proxyTaskMedia(c, task, descriptor); err != nil {
+		writeTaskMediaProxyError(c, err)
+	}
+}
+
+func taskArtifactClientHeaders(headers http.Header) map[string]string {
+	result := make(map[string]string, 4)
+	for _, name := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			result[name] = value
+		}
+	}
+	return result
+}
+
+/*
+	The task list handlers below deliberately do not call projectTaskArtifacts.
+	Artifact projection is confined to the explicit endpoints above.
+*/
 
 func GetAllTask(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
-	// 解析其他查询参数
-	queryParams := model.SyncTaskQueryParams{
-		Platform:       constant.TaskPlatform(c.Query("platform")),
-		TaskID:         c.Query("task_id"),
-		Status:         c.Query("status"),
-		Action:         c.Query("action"),
-		StartTimestamp: startTimestamp,
-		EndTimestamp:   endTimestamp,
-		ChannelID:      c.Query("channel_id"),
-	}
-
+	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp, ChannelID: c.Query("channel_id")}
 	items := model.TaskGetAllTasks(pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
-	total := model.TaskCountAllTasks(queryParams)
-	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(items)
+	pageInfo.SetTotal(int(model.TaskCountAllTasks(queryParams)))
+	pageInfo.SetItems(tasksToDto(items, true, c.GetInt("role")))
 	common.ApiSuccess(c, pageInfo)
 }
 
 func GetUserTask(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-
-	userId := c.GetInt("id")
-
+	userID := c.GetInt("id")
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
-
-	queryParams := model.SyncTaskQueryParams{
-		Platform:       constant.TaskPlatform(c.Query("platform")),
-		TaskID:         c.Query("task_id"),
-		Status:         c.Query("status"),
-		Action:         c.Query("action"),
-		StartTimestamp: startTimestamp,
-		EndTimestamp:   endTimestamp,
-	}
-
-	items := model.TaskGetAllUserTask(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
-	total := model.TaskCountAllUserTask(userId, queryParams)
-	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(items)
+	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp}
+	items := model.TaskGetAllUserTask(userID, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
+	pageInfo.SetTotal(int(model.TaskCountAllUserTask(userID, queryParams)))
+	pageInfo.SetItems(tasksToDto(items, false, common.RoleCommonUser))
 	common.ApiSuccess(c, pageInfo)
+}
+
+func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskDto {
+	var userIDMap map[int]*model.UserBase
+	if fillUser {
+		userIDMap = make(map[int]*model.UserBase)
+		userIDs := types.NewSet[int]()
+		for _, task := range tasks {
+			userIDs.Add(task.UserId)
+		}
+		for _, userID := range userIDs.Items() {
+			if cacheUser, err := model.GetUserCache(userID); err == nil {
+				userIDMap[userID] = cacheUser
+			}
+		}
+	}
+	result := make([]*dto.TaskDto, len(tasks))
+	for i, task := range tasks {
+		if fillUser {
+			if user, ok := userIDMap[task.UserId]; ok {
+				task.Username = user.Username
+			}
+		}
+		item := relay.TaskModel2Dto(task)
+		item.LegacyVideoAvailable = legacyVideoAvailable(task)
+		if task.Status == model.TaskStatusSuccess {
+			item.ResultURL = ""
+			if taskFailReasonIsLegacyResultURL(task.FailReason) {
+				item.FailReason = ""
+			}
+		}
+		if viewerRole >= common.RoleAdminUser {
+			adminInfo := &dto.TaskAdminInfo{}
+			if execution := task.PrivateData.Execution; execution != nil {
+				adminInfo.RequestID = execution.RequestID
+				adminInfo.RequestPath = execution.RequestPath
+				if snapshot := execution.TaskPlugin; snapshot != nil {
+					adminInfo.TaskPlugin = &dto.TaskPluginInfo{
+						Key:     snapshot.Key,
+						Name:    snapshot.Name,
+						Version: snapshot.Version,
+					}
+					if snapshot.Author != nil {
+						adminInfo.TaskPlugin.Author = &dto.TaskPluginAuthorInfo{
+							Name: snapshot.Author.Name,
+							URL:  snapshot.Author.URL,
+						}
+					}
+				}
+			}
+			if adminInfo.RequestID != "" || adminInfo.RequestPath != "" || adminInfo.TaskPlugin != nil {
+				item.AdminInfo = adminInfo
+			}
+		}
+		if viewerRole >= common.RoleRootUser {
+			rootInfo := &dto.TaskRootInfo{
+				UpstreamTaskID: task.PrivateData.UpstreamTaskID,
+				NodeName:       task.PrivateData.NodeName,
+			}
+			if execution := task.PrivateData.Execution; execution != nil {
+				if snapshot := execution.TaskPlugin; snapshot != nil {
+					rootInfo.TaskPlugin = &dto.TaskPluginRuntimeInfo{
+						Key:        snapshot.Key,
+						Version:    snapshot.Version,
+						APIVersion: snapshot.APIVersion,
+						Generation: snapshot.Generation,
+					}
+				}
+			}
+			if rootInfo.TaskPlugin != nil || rootInfo.UpstreamTaskID != "" || rootInfo.NodeName != "" {
+				item.RootInfo = rootInfo
+			}
+		}
+		result[i] = item
+	}
+	return result
+}
+
+func taskFailReasonIsLegacyResultURL(value string) bool {
+	value = strings.TrimSpace(value)
+	return len(value) >= len("https://") && strings.EqualFold(value[:len("https://")], "https://") ||
+		len(value) >= len("http://") && strings.EqualFold(value[:len("http://")], "http://") ||
+		len(value) >= len("data:") && strings.EqualFold(value[:len("data:")], "data:")
 }

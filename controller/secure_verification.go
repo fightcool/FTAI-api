@@ -1,314 +1,155 @@
 package controller
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
-	"time"
+	"slices"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/service"
 	passkeysvc "github.com/QuantumNous/new-api/service/passkey"
 	"github.com/QuantumNous/new-api/setting/system_setting"
-
-	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"github.com/go-webauthn/webauthn/protocol"
 )
 
-const (
-	// SecureVerificationSessionKey 安全验证的 session key
-	SecureVerificationSessionKey = "secure_verified_at"
-	// SecureVerificationTimeout 验证有效期（秒）
-	SecureVerificationTimeout = 300 // 5分钟
-)
-
-type UniversalVerifyRequest struct {
-	Method string `json:"method"` // "2fa" 或 "passkey"
-	Code   string `json:"code,omitempty"`
+func GetVerificationMethods(c *gin.Context) {
+	identity, ok := middleware.GetSessionAuthIdentity(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "当前认证方式不支持安全验证"})
+		return
+	}
+	requirements, err := service.GetVerificationRequirements(identity, c.Query("scope"))
+	if err != nil {
+		writeSecurityOperationError(c, err)
+		return
+	}
+	common.ApiSuccess(c, requirements)
 }
 
-type VerificationStatusResponse struct {
-	Verified  bool  `json:"verified"`
-	ExpiresAt int64 `json:"expires_at,omitempty"`
-}
-
-// UniversalVerify 通用验证接口
-// 支持 2FA 和 Passkey 验证，验证成功后在 session 中记录时间戳
-func UniversalVerify(c *gin.Context) {
-	userId := c.GetInt("id")
-	if userId == 0 {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "未登录",
-		})
-		return
-	}
-
-	var req UniversalVerifyRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		common.ApiError(c, fmt.Errorf("参数错误: %v", err))
-		return
-	}
-
-	// 获取用户信息
-	user := &model.User{Id: userId}
-	if err := user.FillUserById(); err != nil {
-		common.ApiError(c, fmt.Errorf("获取用户信息失败: %v", err))
-		return
-	}
-
-	if user.Status != common.UserStatusEnabled {
-		common.ApiError(c, fmt.Errorf("该用户已被禁用"))
-		return
-	}
-
-	// 检查用户的验证方式
-	twoFA, _ := model.GetTwoFAByUserId(userId)
-	has2FA := twoFA != nil && twoFA.IsEnabled
-
-	passkey, passkeyErr := model.GetPasskeyByUserID(userId)
-	hasPasskey := passkeyErr == nil && passkey != nil
-
-	if !has2FA && !hasPasskey {
-		common.ApiError(c, fmt.Errorf("用户未启用2FA或Passkey"))
-		return
-	}
-
-	// 根据验证方式进行验证
-	var verified bool
-	var verifyMethod string
-
-	switch req.Method {
-	case "2fa":
-		if !has2FA {
-			common.ApiError(c, fmt.Errorf("用户未启用2FA"))
-			return
+// writeSecurityOperationError only exposes known, fixed business messages.
+// Unexpected errors retain their cause for the existing server-side auth logger.
+func writeSecurityOperationError(c *gin.Context, err error) {
+	status := http.StatusOK
+	var code, message string
+	var protocolError *protocol.Error
+	switch {
+	case errors.Is(err, passkeysvc.ErrRPIDUnavailable):
+		code, message = "PASSKEY_RP_ID_UNAVAILABLE", i18n.T(c, i18n.MsgPasskeyRPIDUnavailable)
+	case errors.Is(err, system_setting.ErrPasskeyRPIDInvalid):
+		code, message = "PASSKEY_RP_ID_INVALID", i18n.T(c, i18n.MsgPasskeyRPIDInvalid)
+	case errors.Is(err, service.ErrAccountEmailInvalid), errors.Is(err, service.ErrAccountEmailRestricted):
+		code, message = "EMAIL_ADDRESS_REJECTED", err.Error()
+	case errors.Is(err, model.ErrEmailAlreadyTaken):
+		code, message = "EMAIL_ALREADY_TAKEN", "This email address is already in use."
+	case errors.Is(err, service.ErrEmailBindingDelivery):
+		code, message = "EMAIL_BINDING_DELIVERY_FAILED", err.Error()
+	case errors.Is(err, model.ErrEmailBindingCodeInvalid):
+		code, message = "EMAIL_BINDING_CODE_INVALID", err.Error()
+	case errors.Is(err, model.ErrEmailBindingLocked):
+		code, message = "EMAIL_BINDING_LOCKED", err.Error()
+	case errors.Is(err, model.ErrEmailBindingResendWait):
+		status = http.StatusTooManyRequests
+		code, message = "EMAIL_BINDING_RESEND_WAIT", err.Error()
+	case errors.Is(err, common.ErrAccountPasswordLength), errors.Is(err, common.ErrAccountPasswordSame), errors.Is(err, common.ErrPasswordLegacyLimit):
+		code, message = "PASSWORD_POLICY_REJECTED", err.Error()
+	case errors.Is(err, model.ErrCurrentPasswordInvalid):
+		code, message = "CURRENT_PASSWORD_INVALID", err.Error()
+	case errors.Is(err, model.ErrAccountPasswordState), errors.Is(err, model.ErrAccountBindingChanged):
+		status = http.StatusConflict
+		code, message = "ACCOUNT_SECURITY_STATE_CHANGED", err.Error()
+	case errors.Is(err, model.ErrLastLoginMethod):
+		code, message = "LAST_LOGIN_METHOD", err.Error()
+	case errors.Is(err, oauth.ErrTelegramOAuthNotConfigured):
+		code, message = "TELEGRAM_OAUTH_NOT_CONFIGURED", oauth.ErrTelegramOAuthNotConfigured.Error()
+	case errors.Is(err, oauth.ErrTelegramOAuthConflict):
+		code, message = "TELEGRAM_OAUTH_CONFLICT", oauth.ErrTelegramOAuthConflict.Error()
+	case errors.Is(err, oauth.ErrTelegramOAuthFailed):
+		code, message = "TELEGRAM_OAUTH_FAILED", oauth.ErrTelegramOAuthFailed.Error()
+	case errors.Is(err, oauth.ErrTelegramAccountNotBound):
+		code, message = "TELEGRAM_ACCOUNT_NOT_BOUND", oauth.ErrTelegramAccountNotBound.Error()
+	case errors.Is(err, model.ErrExternalIdentityAlreadyClaimed):
+		code, message = "ACCOUNT_ALREADY_BOUND", "This external account is already bound."
+		if c.Param("provider") == "telegram" {
+			code, message = "TELEGRAM_BIND_ALREADY_BOUND", "This Telegram account is already bound."
 		}
-		if req.Code == "" {
-			common.ApiError(c, fmt.Errorf("验证码不能为空"))
-			return
-		}
-		verified = validateTwoFactorAuth(twoFA, req.Code)
-		verifyMethod = "2FA"
-
-	case "passkey":
-		if !hasPasskey {
-			common.ApiError(c, fmt.Errorf("用户未启用Passkey"))
-			return
-		}
-		// Passkey 验证需要先调用 PasskeyVerifyBegin 和 PasskeyVerifyFinish
-		// 这里只是验证 Passkey 验证流程是否已经完成
-		// 实际上，前端应该先调用这两个接口，然后再调用本接口
-		verified = true // Passkey 验证逻辑已在 PasskeyVerifyFinish 中完成
-		verifyMethod = "Passkey"
-
+	case errors.Is(err, service.ErrVerificationContextInvalid):
+		status = http.StatusBadRequest
+		code, message = "SECURITY_CONTEXT_INVALID", service.ErrVerificationContextInvalid.Error()
+	case errors.Is(err, service.ErrVerificationForbidden):
+		status = http.StatusForbidden
+		code, message = "SECURITY_ACTION_FORBIDDEN", service.ErrVerificationForbidden.Error()
+	case errors.Is(err, service.ErrVerificationFailed), errors.As(err, &protocolError):
+		code, message = "SECURITY_VERIFICATION_FAILED", service.ErrVerificationFailed.Error()
+	case errors.Is(err, service.ErrVerificationLocked):
+		code, message = "SECURITY_VERIFICATION_LOCKED", service.ErrVerificationLocked.Error()
+	case errors.Is(err, service.ErrVerificationUnavailable):
+		code, message = "SECURITY_METHOD_UNAVAILABLE", service.ErrVerificationUnavailable.Error()
+	case errors.Is(err, service.ErrVerificationFlowRequired):
+		status = http.StatusBadRequest
+		code, message = "SECURITY_VERIFICATION_FLOW_REQUIRED", service.ErrVerificationFlowRequired.Error()
+	case errors.Is(err, service.ErrProofMethod):
+		code, message = "SECURITY_PROOF_METHOD_MISMATCH", "This verification method is not allowed for this action."
+	case errors.Is(err, service.ErrProofScope):
+		code, message = "SECURITY_PROOF_SCOPE_MISMATCH", "Verification does not match this action."
+	case errors.Is(err, service.ErrOAuthAccountMismatch):
+		code, message = "OAUTH_ACCOUNT_MISMATCH", service.ErrOAuthAccountMismatch.Error()
+	case errors.Is(err, model.ErrTwoFASetupInvalid):
+		status = http.StatusConflict
+		code, message = "TWOFA_SETUP_INVALID", model.ErrTwoFASetupInvalid.Error()
+	case errors.Is(err, model.ErrTwoFACodeInvalid):
+		code, message = "TWOFA_CODE_INVALID", model.ErrTwoFACodeInvalid.Error()
+	case errors.Is(err, model.ErrTwoFAAlreadyEnabled):
+		code, message = "TWOFA_ALREADY_ENABLED", "Two-factor authentication is already enabled."
+	case errors.Is(err, model.ErrTwoFANotEnabled):
+		code, message = "TWOFA_NOT_ENABLED", "Two-factor authentication is not enabled."
+	case errors.Is(err, model.ErrPasskeyNotFound):
+		code, message = "PASSKEY_NOT_FOUND", "No Passkey is registered."
+	case errors.Is(err, model.ErrAuthFlowInvalid), errors.Is(err, model.ErrAuthFlowExpired), errors.Is(err, model.ErrAuthFlowConsumed):
+		code, message = "AUTH_FLOW_INVALID", "Verification flow expired"
+	case errors.Is(err, model.ErrUserSessionInvalid), errors.Is(err, model.ErrUserSessionInactive):
+		writeAuthSessionError(c, service.ErrAuthTokenInvalid)
+		return
 	default:
-		common.ApiError(c, fmt.Errorf("不支持的验证方式: %s", req.Method))
+		c.Set("security_error_code", "AUTH_INTERNAL_ERROR")
+		writeAuthSessionError(c, err)
 		return
 	}
-
-	if !verified {
-		common.ApiError(c, fmt.Errorf("验证失败，请检查验证码"))
-		return
+	c.Set("security_error_code", code)
+	if strings.Contains(c.Request.URL.Path, "/passkey/") {
+		reason := "verification_failed"
+		if errors.As(err, &protocolError) && slices.Contains([]string{"invalid_request", "challenge_mismatch", "parse_error", "auth_data", "verification_error", "invalid_signature", "invalid_key_type", "unsupported_key_algorithm"}, protocolError.Type) {
+			reason = protocolError.Type
+		}
+		// Protocol details can contain challenges and client-controlled data.
+		// Only fixed categories and the server-selected public RP ID are logged.
+		logger.LogWarn(c.Request.Context(), "passkey verification rejected: code=%s reason=%s rp_id=%q", code, reason, c.GetString("passkey_rp_id"))
 	}
-
-	// 验证成功，在 session 中记录时间戳
-	session := sessions.Default(c)
-	now := time.Now().Unix()
-	session.Set(SecureVerificationSessionKey, now)
-	if err := session.Save(); err != nil {
-		common.ApiError(c, fmt.Errorf("保存验证状态失败: %v", err))
-		return
-	}
-
-	// 记录日志
-	model.RecordLog(userId, model.LogTypeSystem, fmt.Sprintf("通用安全验证成功 (验证方式: %s)", verifyMethod))
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "验证成功",
-		"data": gin.H{
-			"verified":   true,
-			"expires_at": now + SecureVerificationTimeout,
-		},
-	})
+	c.JSON(status, gin.H{"success": false, "code": code, "message": message})
 }
 
-// GetVerificationStatus 获取验证状态
-func GetVerificationStatus(c *gin.Context) {
-	userId := c.GetInt("id")
-	if userId == 0 {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "未登录",
-		})
-		return
-	}
-
-	session := sessions.Default(c)
-	verifiedAtRaw := session.Get(SecureVerificationSessionKey)
-
-	if verifiedAtRaw == nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "",
-			"data": VerificationStatusResponse{
-				Verified: false,
-			},
-		})
-		return
-	}
-
-	verifiedAt, ok := verifiedAtRaw.(int64)
+func UniversalVerify(c *gin.Context) {
+	identity, ok := middleware.GetSessionAuthIdentity(c)
 	if !ok {
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "",
-			"data": VerificationStatusResponse{
-				Verified: false,
-			},
-		})
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "当前认证方式不支持安全验证"})
 		return
 	}
-
-	elapsed := time.Now().Unix() - verifiedAt
-	if elapsed >= SecureVerificationTimeout {
-		// 验证已过期
-		session.Delete(SecureVerificationSessionKey)
-		_ = session.Save()
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "",
-			"data": VerificationStatusResponse{
-				Verified: false,
-			},
-		})
+	var request service.VerificationInput
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		common.ApiErrorMsg(c, "参数错误")
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data": VerificationStatusResponse{
-			Verified:  true,
-			ExpiresAt: verifiedAt + SecureVerificationTimeout,
-		},
-	})
-}
-
-// CheckSecureVerification 检查是否已通过安全验证
-// 返回 true 表示验证有效，false 表示需要重新验证
-func CheckSecureVerification(c *gin.Context) bool {
-	session := sessions.Default(c)
-	verifiedAtRaw := session.Get(SecureVerificationSessionKey)
-
-	if verifiedAtRaw == nil {
-		return false
-	}
-
-	verifiedAt, ok := verifiedAtRaw.(int64)
-	if !ok {
-		return false
-	}
-
-	elapsed := time.Now().Unix() - verifiedAt
-	if elapsed >= SecureVerificationTimeout {
-		// 验证已过期，清除 session
-		session.Delete(SecureVerificationSessionKey)
-		_ = session.Save()
-		return false
-	}
-
-	return true
-}
-
-// PasskeyVerifyAndSetSession Passkey 验证完成后设置 session
-// 这是一个辅助函数，供 PasskeyVerifyFinish 调用
-func PasskeyVerifyAndSetSession(c *gin.Context) {
-	session := sessions.Default(c)
-	now := time.Now().Unix()
-	session.Set(SecureVerificationSessionKey, now)
-	_ = session.Save()
-}
-
-// PasskeyVerifyForSecure 用于安全验证的 Passkey 验证流程
-// 整合了 begin 和 finish 流程
-func PasskeyVerifyForSecure(c *gin.Context) {
-	if !system_setting.GetPasskeySettings().Enabled {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "管理员未启用 Passkey 登录",
-		})
-		return
-	}
-
-	userId := c.GetInt("id")
-	if userId == 0 {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "未登录",
-		})
-		return
-	}
-
-	user := &model.User{Id: userId}
-	if err := user.FillUserById(); err != nil {
-		common.ApiError(c, fmt.Errorf("获取用户信息失败: %v", err))
-		return
-	}
-
-	if user.Status != common.UserStatusEnabled {
-		common.ApiError(c, fmt.Errorf("该用户已被禁用"))
-		return
-	}
-
-	credential, err := model.GetPasskeyByUserID(userId)
+	proof, err := service.VerifySecurityInput(identity, request)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "该用户尚未绑定 Passkey",
-		})
+		writeSecurityOperationError(c, err)
 		return
 	}
-
-	wa, err := passkeysvc.BuildWebAuthn(c.Request)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	waUser := passkeysvc.NewWebAuthnUser(user, credential)
-	sessionData, err := passkeysvc.PopSessionData(c, passkeysvc.VerifySessionKey)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	_, err = wa.FinishLogin(waUser, *sessionData, c.Request)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	// 更新凭证的最后使用时间
-	now := time.Now()
-	credential.LastUsedAt = &now
-	if err := model.UpsertPasskeyCredential(credential); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	// 验证成功，设置 session
-	PasskeyVerifyAndSetSession(c)
-
-	// 记录日志
-	model.RecordLog(userId, model.LogTypeSystem, "Passkey 安全验证成功")
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Passkey 验证成功",
-		"data": gin.H{
-			"verified":   true,
-			"expires_at": time.Now().Unix() + SecureVerificationTimeout,
-		},
-	})
+	recordUserSecurityAudit(c, identity.UserID, "user.security_verify", map[string]any{"method": proof.Method, "scope": proof.Scope})
+	common.ApiSuccess(c, proof)
 }

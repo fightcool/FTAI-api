@@ -1,8 +1,11 @@
 package model_setting
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/config"
 )
 
@@ -50,21 +53,34 @@ func GetClaudeSettings() *ClaudeSettings {
 func (c *ClaudeSettings) WriteHeaders(originModel string, httpHeader *http.Header) {
 	if headers, ok := c.HeadersSettings[originModel]; ok {
 		for headerKey, headerValues := range headers {
-			// get existing values for this header key
-			existingValues := httpHeader.Values(headerKey)
-			existingValuesMap := make(map[string]bool)
-			for _, v := range existingValues {
-				existingValuesMap[v] = true
+			mergedValues := normalizeHeaderListValues(
+				append(append([]string(nil), httpHeader.Values(headerKey)...), headerValues...),
+			)
+			if len(mergedValues) == 0 {
+				continue
 			}
-
-			// add only values that don't already exist
-			for _, headerValue := range headerValues {
-				if !existingValuesMap[headerValue] {
-					httpHeader.Add(headerKey, headerValue)
-				}
-			}
+			httpHeader.Set(headerKey, strings.Join(mergedValues, ","))
 		}
 	}
+}
+
+func normalizeHeaderListValues(values []string) []string {
+	normalizedValues := make([]string, 0, len(values))
+	seenValues := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		for item := range strings.SplitSeq(value, ",") {
+			normalizedItem := strings.TrimSpace(item)
+			if normalizedItem == "" {
+				continue
+			}
+			if _, exists := seenValues[normalizedItem]; exists {
+				continue
+			}
+			seenValues[normalizedItem] = struct{}{}
+			normalizedValues = append(normalizedValues, normalizedItem)
+		}
+	}
+	return normalizedValues
 }
 
 func (c *ClaudeSettings) GetDefaultMaxTokens(model string) int {
@@ -72,4 +88,24 @@ func (c *ClaudeSettings) GetDefaultMaxTokens(model string) int {
 		return maxTokens
 	}
 	return c.DefaultMaxTokens["default"]
+}
+
+// ValidateClaudeDefaultMaxTokens validates the JSON persisted by the option
+// API. Zero stays allowed — the current Messages API accepts max_tokens: 0 as
+// cache pre-warming — but negative values are rejected because they would
+// wrap into huge unsigned values during request conversion.
+func ValidateClaudeDefaultMaxTokens(value string) error {
+	var settings map[string]int
+	if err := common.UnmarshalJsonStr(value, &settings); err != nil {
+		return fmt.Errorf("Claude default max tokens must be a JSON map of model to integer: %w", err)
+	}
+	if settings == nil {
+		return fmt.Errorf("Claude default max tokens must be a JSON map of model to integer")
+	}
+	for model, maxTokens := range settings {
+		if maxTokens < 0 {
+			return fmt.Errorf("negative Claude default max_tokens %d for %q", maxTokens, model)
+		}
+	}
+	return nil
 }

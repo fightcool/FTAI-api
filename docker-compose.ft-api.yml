@@ -1,0 +1,36 @@
+name: ft-api-new
+
+services:
+  new-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGETOS: linux
+        TARGETARCH: ${TARGETARCH:-amd64}
+    image: ${APP_IMAGE:-ft-api:current}
+    container_name: ft-api
+    restart: unless-stopped
+    init: true
+    command: --log-dir /app/logs
+    env_file:
+      - ${APP_ENV_FILE:-.env}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      NODE_NAME: ${NODE_NAME:-ft-api-node-1}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-3000}:3000"
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O - http://127.0.0.1:3000/api/status | grep -q '\"success\":true' || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    stop_grace_period: 30s

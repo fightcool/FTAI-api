@@ -1,6 +1,7 @@
 package ratio_setting
 
 import (
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,9 +27,7 @@ func InvalidateExposedDataCache() {
 
 func cloneGinH(src gin.H) gin.H {
 	dst := make(gin.H, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
+	maps.Copy(dst, src)
 	return dst
 }
 
@@ -42,10 +41,11 @@ func GetExposedData() gin.H {
 		return cloneGinH(c.data)
 	}
 	newData := gin.H{
-		"model_ratio":      GetModelRatioCopy(),
-		"completion_ratio": GetCompletionRatioCopy(),
-		"cache_ratio":      GetCacheRatioCopy(),
-		"model_price":      GetModelPriceCopy(),
+		"model_ratio":        GetModelRatioCopy(),
+		"completion_ratio":   GetCompletionRatioCopy(),
+		"cache_ratio":        GetCacheRatioCopy(),
+		"create_cache_ratio": GetCreateCacheRatioCopy(),
+		"model_price":        GetModelPriceCopy(),
 	}
 	exposedData.Store(&exposedCache{
 		data:      newData,

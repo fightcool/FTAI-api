@@ -4,10 +4,6 @@ import (
 	"encoding/json"
 )
 
-type TaskData interface {
-	SunoDataResponse | []SunoDataResponse | string | any
-}
-
 type SunoSubmitReq struct {
 	GptDescriptionPrompt string  `json:"gpt_description_prompt,omitempty"`
 	Prompt               string  `json:"prompt,omitempty"`
@@ -18,10 +14,6 @@ type SunoSubmitReq struct {
 	TaskID               string  `json:"task_id,omitempty"`
 	ContinueClipId       string  `json:"continue_clip_id,omitempty"`
 	MakeInstrumental     bool    `json:"make_instrumental"`
-}
-
-type FetchReq struct {
-	IDs []string `json:"ids"`
 }
 
 type SunoDataResponse struct {
@@ -50,13 +42,13 @@ type SunoSong struct {
 }
 
 type SunoMetadata struct {
-	Tags                 string      `json:"tags"`
-	Prompt               string      `json:"prompt"`
-	GPTDescriptionPrompt interface{} `json:"gpt_description_prompt"`
-	AudioPromptID        interface{} `json:"audio_prompt_id"`
-	Duration             interface{} `json:"duration"`
-	ErrorType            interface{} `json:"error_type"`
-	ErrorMessage         interface{} `json:"error_message"`
+	Tags                 string `json:"tags"`
+	Prompt               string `json:"prompt"`
+	GPTDescriptionPrompt any    `json:"gpt_description_prompt"`
+	AudioPromptID        any    `json:"audio_prompt_id"`
+	Duration             any    `json:"duration"`
+	ErrorType            any    `json:"error_type"`
+	ErrorMessage         any    `json:"error_message"`
 }
 
 type SunoLyrics struct {
@@ -64,30 +56,6 @@ type SunoLyrics struct {
 	Status string `json:"status"`
 	Title  string `json:"title"`
 	Text   string `json:"text"`
-}
-
-const TaskSuccessCode = "success"
-
-type TaskResponse[T TaskData] struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Data    T      `json:"data"`
-}
-
-func (t *TaskResponse[T]) IsSuccess() bool {
-	return t.Code == TaskSuccessCode
-}
-
-type TaskDto struct {
-	TaskID     string          `json:"task_id"` // 第三方id，不一定有/ song id\ Task id
-	Action     string          `json:"action"`  // 任务类型, song, lyrics, description-mode
-	Status     string          `json:"status"`  // 任务状态, submitted, queueing, processing, success, failed
-	FailReason string          `json:"fail_reason"`
-	SubmitTime int64           `json:"submit_time"`
-	StartTime  int64           `json:"start_time"`
-	FinishTime int64           `json:"finish_time"`
-	Progress   string          `json:"progress"`
-	Data       json.RawMessage `json:"data"`
 }
 
 type SunoGoAPISubmitReq struct {

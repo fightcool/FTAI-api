@@ -1,7 +1,7 @@
 package controller
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,47 +10,72 @@ import (
 	"sync"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/QuantumNous/new-api/constant"
 
-	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type LoginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username          string `json:"username"`
+	Password          string `json:"password"`
+	PasswordEncrypted string `json:"password_encrypted"`
+	EncryptionKeyID   string `json:"encryption_key_id"`
+}
+
+func GetPasswordEncryptionKey(c *gin.Context) {
+	if !common.PasswordLoginEncryptionEnabled {
+		common.ApiSuccess(c, gin.H{"enabled": false})
+		return
+	}
+	keyID, publicKey := common.PasswordEncryptionPublicKey()
+	if keyID == "" || publicKey == "" {
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
+	common.ApiSuccess(c, gin.H{
+		"enabled":    true,
+		"kid":        keyID,
+		"public_key": publicKey,
+	})
 }
 
 func Login(c *gin.Context) {
 	if !common.PasswordLoginEnabled {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "管理员关闭了密码登录",
-			"success": false,
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserPasswordLoginDisabled)
 		return
 	}
 	var loginRequest LoginRequest
-	err := json.NewDecoder(c.Request.Body).Decode(&loginRequest)
+	err := common.DecodeJson(c.Request.Body, &loginRequest)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "无效的参数",
-			"success": false,
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 	username := loginRequest.Username
 	password := loginRequest.Password
+	if common.PasswordLoginEncryptionEnabled {
+		if loginRequest.PasswordEncrypted == "" || loginRequest.EncryptionKeyID == "" {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		password, err = common.DecryptPassword(loginRequest.PasswordEncrypted, loginRequest.EncryptionKeyID)
+		if err != nil {
+			common.ApiErrorI18n(c, i18n.MsgUserUsernameOrPasswordError)
+			return
+		}
+	}
 	if username == "" || password == "" {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "无效的参数",
-			"success": false,
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 	user := model.User{
@@ -59,149 +84,189 @@ func Login(c *gin.Context) {
 	}
 	err = user.ValidateAndFill()
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"message": err.Error(),
-			"success": false,
-		})
-		return
-	}
-
-	// 检查是否启用2FA
-	if model.IsTwoFAEnabled(user.Id) {
-		// 设置pending session，等待2FA验证
-		session := sessions.Default(c)
-		session.Set("pending_username", user.Username)
-		session.Set("pending_user_id", user.Id)
-		err := session.Save()
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"message": "无法保存会话信息，请重试",
-				"success": false,
-			})
-			return
+		switch {
+		case errors.Is(err, model.ErrDatabase):
+			common.SysLog(fmt.Sprintf("Login database error for user %s: %v", username, err))
+			common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		case errors.Is(err, model.ErrUserEmptyCredentials):
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		default:
+			common.ApiErrorI18n(c, i18n.MsgUserUsernameOrPasswordError)
 		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"message": "请输入两步验证码",
-			"success": true,
-			"data": map[string]interface{}{
-				"require_2fa": true,
-			},
-		})
 		return
 	}
 
 	setupLogin(&user, c)
 }
 
-// setup session & cookies and then return user info
-func setupLogin(user *model.User, c *gin.Context) {
-	session := sessions.Default(c)
-	session.Set("id", user.Id)
-	session.Set("username", user.Username)
-	session.Set("role", user.Role)
-	session.Set("status", user.Status)
-	session.Set("group", user.Group)
-	err := session.Save()
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "无法保存会话信息，请重试",
-			"success": false,
-		})
-		return
+// loginMethodFromContext 根据请求路径推导登录方式，用于登录审计日志。
+func loginMethodFromContext(c *gin.Context) string {
+	if method := c.GetString("login_method"); method != "" {
+		return method
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"message": "",
-		"success": true,
-		"data": map[string]any{
-			"id":           user.Id,
-			"username":     user.Username,
-			"display_name": user.DisplayName,
-			"role":         user.Role,
-			"status":       user.Status,
-			"group":        user.Group,
-		},
-	})
+	switch c.FullPath() {
+	case "/api/user/login":
+		return "password"
+	case "/api/user/login/2fa":
+		return "2fa"
+	case "/api/user/passkey/login/finish":
+		return "passkey"
+	case "/api/oauth/wechat":
+		return "wechat"
+	case "/api/oauth/telegram/login":
+		return "telegram"
+	case "/api/oauth/:provider":
+		if provider := c.Param("provider"); provider != "" {
+			return "oauth:" + provider
+		}
+		return "oauth"
+	default:
+		return "unknown"
+	}
 }
 
-func Logout(c *gin.Context) {
-	session := sessions.Default(c)
-	session.Clear()
-	err := session.Save()
+// recordLoginAudit 记录登录成功审计日志（对所有用户启用，仅记录成功，不记录失败）。
+func recordLoginAudit(user *model.User, c *gin.Context) {
+	method := loginMethodFromContext(c)
+	ip := c.ClientIP()
+	extra := model.AuditOther{
+		LoginMethod: method,
+		UserAgent:   c.Request.UserAgent(),
+	}
+	content := fmt.Sprintf("Logged in successfully via %s", method)
+	params := map[string]any{
+		"method": method,
+	}
+	if verifiedMethod := c.GetString("login_verification_method"); verifiedMethod != "" {
+		params["verification_method"] = verifiedMethod
+	}
+	model.RecordLoginLog(user.Id, user.Role, user.Username, content, ip, "login", params, extra, c)
+}
+
+// setupLogin evaluates the shared login policy after primary authentication.
+// Only a completed Passkey ceremony may go directly to session issuance.
+func setupLogin(user *model.User, c *gin.Context) {
+	challenge, err := service.StartLoginVerification(user, loginMethodFromContext(c))
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"message": err.Error(),
-			"success": false,
-		})
+		writeSecurityOperationError(c, err)
 		return
 	}
+	if challenge != nil {
+		setAuthNoStore(c)
+		common.ApiSuccess(c, challenge)
+		return
+	}
+	setupLoginAtAuthVersion(user, user.AuthVersion, c)
+}
+
+func setupLoginAtAuthVersion(user *model.User, expectedAuthVersion int64, c *gin.Context) {
+	if user == nil || user.Id <= 0 || user.Status != common.UserStatusEnabled {
+		common.ApiErrorI18n(c, i18n.MsgAuthUserBanned)
+		return
+	}
+	currentUser, err := model.GetSelfUserById(user.Id)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	var bundle *service.AuthBundle
+	if expectedAuthVersion > 0 {
+		bundle, err = service.CreateLoginSessionAtAuthVersion(
+			user.Id,
+			expectedAuthVersion,
+			loginMethodFromContext(c),
+			c.ClientIP(),
+			c.Request.UserAgent(),
+		)
+	} else {
+		bundle, err = service.CreateLoginSession(
+			user.Id,
+			loginMethodFromContext(c),
+			c.ClientIP(),
+			c.Request.UserAgent(),
+		)
+	}
+	if err != nil {
+		writeAuthSessionError(c, err)
+		return
+	}
+	writeLoginResponse(c, currentUser, bundle)
+}
+
+func writeLoginResponse(c *gin.Context, user *model.User, bundle *service.AuthBundle) {
+	c.Set("login_method", bundle.Session.LoginMethod)
+	model.UpdateUserLastLoginAt(user.Id)
+	service.WriteRefreshCookie(c, bundle.RefreshToken)
+	setAuthNoStore(c)
+	recordLoginAudit(user, c)
 	c.JSON(http.StatusOK, gin.H{
 		"message": "",
 		"success": true,
+		"data": gin.H{
+			"access_token":      bundle.AccessToken,
+			"token_type":        bundle.TokenType,
+			"access_expires_at": bundle.AccessExpiresAt,
+			"session":           bundle.Session,
+			"user":              buildSelfUserData(user),
+		},
 	})
 }
 
 func Register(c *gin.Context) {
 	if !common.RegisterEnabled {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "管理员关闭了新用户注册",
-			"success": false,
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserRegisterDisabled)
 		return
 	}
 	if !common.PasswordRegisterEnabled {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "管理员关闭了通过密码进行注册，请使用第三方账户验证的形式进行注册",
-			"success": false,
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserPasswordRegisterDisabled)
 		return
 	}
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	user.Username = strings.TrimSpace(user.Username)
+	user.Email = model.NormalizeEmail(user.Email)
+	if user.Username == "" {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 	if err := common.Validate.Struct(&user); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "输入不合法 " + err.Error(),
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
 	}
 	if common.EmailVerificationEnabled {
 		if user.Email == "" || user.VerificationCode == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "管理员开启了邮箱验证，请输入邮箱地址和验证码",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserEmailVerificationRequired)
 			return
 		}
 		if !common.VerifyCodeWithKey(user.Email, user.VerificationCode, common.EmailVerificationPurpose) {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "验证码错误或已过期",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserVerificationCodeError)
+			return
+		}
+		if err := model.EnsureEmailAvailable(user.Email, 0); err != nil {
+			if errors.Is(err, model.ErrEmailAlreadyTaken) {
+				common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
+				return
+			}
+			common.ApiErrorI18n(c, i18n.MsgDatabaseError)
 			return
 		}
 	}
-	exist, err := model.CheckUserExistOrDeleted(user.Username, user.Email)
+	emailForExistCheck := ""
+	if common.EmailVerificationEnabled {
+		emailForExistCheck = user.Email
+	}
+	exist, err := model.CheckUserExistOrDeleted(user.Username, emailForExistCheck)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "数据库错误，请稍后重试",
-		})
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
 		common.SysLog(fmt.Sprintf("CheckUserExistOrDeleted error: %v", err))
 		return
 	}
 	if exist {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "用户名已存在，或已注销",
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserExists)
 		return
 	}
 	affCode := user.AffCode // this code is the inviter's code, not the user's own code
@@ -217,6 +282,10 @@ func Register(c *gin.Context) {
 		cleanUser.Email = user.Email
 	}
 	if err := cleanUser.Insert(inviterId); err != nil {
+		if errors.Is(err, model.ErrEmailAlreadyTaken) {
+			common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -224,20 +293,14 @@ func Register(c *gin.Context) {
 	// 获取插入后的用户ID
 	var insertedUser model.User
 	if err := model.DB.Where("username = ?", cleanUser.Username).First(&insertedUser).Error; err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "用户注册失败或用户ID获取失败",
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserRegisterFailed)
 		return
 	}
 	// 生成默认令牌
 	if constant.GenerateDefaultToken {
 		key, err := common.GenerateKey()
 		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "生成默认令牌失败",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserDefaultTokenFailed)
 			common.SysLog("failed to generate token key: " + err.Error())
 			return
 		}
@@ -257,10 +320,7 @@ func Register(c *gin.Context) {
 			token.Group = "auto"
 		}
 		if err := token.Insert(); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "创建默认令牌失败",
-			})
+			common.ApiErrorI18n(c, i18n.MsgCreateDefaultTokenErr)
 			return
 		}
 	}
@@ -274,7 +334,8 @@ func Register(c *gin.Context) {
 
 func GetAllUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.GetAllUsers(pageInfo)
+	sortOptions := model.NewUserSortOptions(c.Query("sort_by"), c.Query("sort_order"))
+	users, total, err := model.GetAllUsers(pageInfo, sortOptions)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -290,8 +351,21 @@ func GetAllUsers(c *gin.Context) {
 func SearchUsers(c *gin.Context) {
 	keyword := c.Query("keyword")
 	group := c.Query("group")
+	var role *int
+	if roleStr := c.Query("role"); roleStr != "" {
+		if parsed, err := strconv.Atoi(roleStr); err == nil {
+			role = &parsed
+		}
+	}
+	var status *int
+	if statusStr := c.Query("status"); statusStr != "" {
+		if parsed, err := strconv.Atoi(statusStr); err == nil {
+			status = &parsed
+		}
+	}
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(keyword, group, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	sortOptions := model.NewUserSortOptions(c.Query("sort_by"), c.Query("sort_order"))
+	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -301,6 +375,10 @@ func SearchUsers(c *gin.Context) {
 	pageInfo.SetItems(users)
 	common.ApiSuccess(c, pageInfo)
 	return
+}
+
+func canManageTargetRole(myRole int, targetRole int) bool {
+	return myRole == common.RoleRootUser || myRole > targetRole
 }
 
 func GetUser(c *gin.Context) {
@@ -315,58 +393,15 @@ func GetUser(c *gin.Context) {
 		return
 	}
 	myRole := c.GetInt("role")
-	if myRole <= user.Role && myRole != common.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权获取同级或更高等级用户的信息",
-		})
+	if !canManageTargetRole(myRole, user.Role) {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
 		return
 	}
+	user.AdminPermissions = authz.Capabilities(user.Id, user.Role)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
 		"data":    user,
-	})
-	return
-}
-
-func GenerateAccessToken(c *gin.Context) {
-	id := c.GetInt("id")
-	user, err := model.GetUserById(id, true)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	// get rand int 28-32
-	randI := common.GetRandomInt(4)
-	key, err := common.GenerateRandomKey(29 + randI)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "生成失败",
-		})
-		common.SysLog("failed to generate key: " + err.Error())
-		return
-	}
-	user.SetAccessToken(key)
-
-	if model.DB.Where("access_token = ?", user.AccessToken).First(user).RowsAffected != 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "请重试，系统生成的 UUID 竟然重复了！",
-		})
-		return
-	}
-
-	if err := user.Update(false); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    user.AccessToken,
 	})
 	return
 }
@@ -376,6 +411,10 @@ type TransferAffQuotaRequest struct {
 }
 
 func TransferAffQuota(c *gin.Context) {
+	if !requirePaymentCompliance(c) {
+		return
+	}
+
 	id := c.GetInt("id")
 	user, err := model.GetUserById(id, true)
 	if err != nil {
@@ -389,16 +428,10 @@ func TransferAffQuota(c *gin.Context) {
 	}
 	err = user.TransferAffQuotaToQuota(tran.Quota)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "划转失败 " + err.Error(),
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserTransferFailed, map[string]any{"Error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "划转成功",
-	})
+	common.ApiSuccessI18n(c, i18n.MsgUserTransferSuccess, nil)
 }
 
 func GetAffCode(c *gin.Context) {
@@ -429,25 +462,39 @@ func GetAffCode(c *gin.Context) {
 func GetSelf(c *gin.Context) {
 	id := c.GetInt("id")
 	userRole := c.GetInt("role")
-	user, err := model.GetUserById(id, false)
+	user, err := model.GetSelfUserById(id)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	// Hide admin remarks: set to empty to trigger omitempty tag, ensuring the remark field is not included in JSON returned to regular users
-	user.Remark = ""
-
-	// 计算用户权限信息
+	responseData := buildSelfUserData(user)
+	// The authenticated role is loaded from GetUserCache. It should equal the
+	// row role, but use it for capabilities so GetSelf and login/refresh remain
+	// consistent with the authorization decision made for this request.
 	permissions := calculateUserPermissions(userRole)
+	permissions["admin_permissions"] = authz.Capabilities(id, userRole)
+	responseData["permissions"] = permissions
 
-	// 获取用户设置并提取sidebar_modules
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    responseData,
+	})
+	return
+}
+
+// buildSelfUserData is the single safe dashboard-user DTO used by GetSelf,
+// login and refresh. It intentionally excludes password, management PAT and
+// administrator-only remarks.
+func buildSelfUserData(user *model.User) map[string]any {
 	userSetting := user.GetSetting()
-
-	// 构建响应数据，包含用户信息和权限
-	responseData := map[string]interface{}{
+	permissions := calculateUserPermissions(user.Role)
+	permissions["admin_permissions"] = authz.Capabilities(user.Id, user.Role)
+	return map[string]any{
 		"id":                user.Id,
 		"username":          user.Username,
 		"display_name":      user.DisplayName,
+		"has_password":      user.HasPassword,
 		"role":              user.Role,
 		"status":            user.Status,
 		"email":             user.Email,
@@ -469,38 +516,31 @@ func GetSelf(c *gin.Context) {
 		"setting":           user.Setting,
 		"stripe_customer":   user.StripeCustomer,
 		"sidebar_modules":   userSetting.SidebarModules, // 正确提取sidebar_modules字段
-		"permissions":       permissions,                // 新增权限字段
+		"permissions":       permissions,
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    responseData,
-	})
-	return
 }
 
 // 计算用户权限的辅助函数
-func calculateUserPermissions(userRole int) map[string]interface{} {
-	permissions := map[string]interface{}{}
+func calculateUserPermissions(userRole int) map[string]any {
+	permissions := map[string]any{}
 
 	// 根据用户角色计算权限
 	if userRole == common.RoleRootUser {
 		// 超级管理员不需要边栏设置功能
 		permissions["sidebar_settings"] = false
-		permissions["sidebar_modules"] = map[string]interface{}{}
+		permissions["sidebar_modules"] = map[string]any{}
 	} else if userRole == common.RoleAdminUser {
 		// 管理员可以设置边栏，但不包含系统设置功能
 		permissions["sidebar_settings"] = true
-		permissions["sidebar_modules"] = map[string]interface{}{
-			"admin": map[string]interface{}{
+		permissions["sidebar_modules"] = map[string]any{
+			"admin": map[string]any{
 				"setting": false, // 管理员不能访问系统设置
 			},
 		}
 	} else {
 		// 普通用户只能设置个人功能，不包含管理员区域
 		permissions["sidebar_settings"] = true
-		permissions["sidebar_modules"] = map[string]interface{}{
+		permissions["sidebar_modules"] = map[string]any{
 			"admin": false, // 普通用户不能访问管理员区域
 		}
 	}
@@ -510,17 +550,17 @@ func calculateUserPermissions(userRole int) map[string]interface{} {
 
 // 根据用户角色生成默认的边栏配置
 func generateDefaultSidebarConfig(userRole int) string {
-	defaultConfig := map[string]interface{}{}
+	defaultConfig := map[string]any{}
 
 	// 聊天区域 - 所有用户都可以访问
-	defaultConfig["chat"] = map[string]interface{}{
+	defaultConfig["chat"] = map[string]any{
 		"enabled":    true,
 		"playground": true,
 		"chat":       true,
 	}
 
 	// 控制台区域 - 所有用户都可以访问
-	defaultConfig["console"] = map[string]interface{}{
+	defaultConfig["console"] = map[string]any{
 		"enabled":    true,
 		"detail":     true,
 		"token":      true,
@@ -530,7 +570,7 @@ func generateDefaultSidebarConfig(userRole int) string {
 	}
 
 	// 个人中心区域 - 所有用户都可以访问
-	defaultConfig["personal"] = map[string]interface{}{
+	defaultConfig["personal"] = map[string]any{
 		"enabled":  true,
 		"topup":    true,
 		"personal": true,
@@ -539,7 +579,7 @@ func generateDefaultSidebarConfig(userRole int) string {
 	// 管理员区域 - 根据角色决定
 	if userRole == common.RoleAdminUser {
 		// 管理员可以访问管理员区域，但不能访问系统设置
-		defaultConfig["admin"] = map[string]interface{}{
+		defaultConfig["admin"] = map[string]any{
 			"enabled":    true,
 			"channel":    true,
 			"models":     true,
@@ -549,7 +589,7 @@ func generateDefaultSidebarConfig(userRole int) string {
 		}
 	} else if userRole == common.RoleRootUser {
 		// 超级管理员可以访问所有功能
-		defaultConfig["admin"] = map[string]interface{}{
+		defaultConfig["admin"] = map[string]any{
 			"enabled":    true,
 			"channel":    true,
 			"models":     true,
@@ -561,7 +601,7 @@ func generateDefaultSidebarConfig(userRole int) string {
 	// 普通用户不包含admin区域
 
 	// 转换为JSON字符串
-	configBytes, err := json.Marshal(defaultConfig)
+	configBytes, err := common.Marshal(defaultConfig)
 	if err != nil {
 		common.SysLog("生成默认边栏配置失败: " + err.Error())
 		return ""
@@ -581,40 +621,43 @@ func GetUserModels(c *gin.Context) {
 		return
 	}
 	groups := service.GetUserUsableGroups(user.Group)
-	var models []string
-	for group := range groups {
-		for _, g := range model.GetGroupEnabledModels(group) {
-			if !common.StringsContains(models, g) {
-				models = append(models, g)
-			}
+	group := c.Query("group")
+	var groupsToQuery []string
+	switch {
+	case group == "":
+		for g := range groups {
+			groupsToQuery = append(groupsToQuery, g)
+		}
+	case group == "auto":
+		if _, ok := groups[group]; ok {
+			groupsToQuery = service.GetUserAutoGroup(user.Group)
+		}
+	default:
+		if _, ok := groups[group]; ok {
+			groupsToQuery = []string{group}
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    models,
+		"data":    service.GetGroupsEnabledModels(groupsToQuery),
 	})
-	return
 }
 
 func UpdateUser(c *gin.Context) {
 	var updatedUser model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&updatedUser)
+	err := common.DecodeJson(c.Request.Body, &updatedUser)
 	if err != nil || updatedUser.Id == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	if updatedUser.Password == "" {
-		updatedUser.Password = "$I_LOVE_U" // make Validator happy :)
+	updatedUser.Username = strings.TrimSpace(updatedUser.Username)
+	if updatedUser.Username == "" {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
 	}
-	if err := common.Validate.Struct(&updatedUser); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "输入不合法 " + err.Error(),
-		})
+	if err := common.Validate.StructExcept(&updatedUser, "Password"); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
 	}
 	originUser, err := model.GetUserById(updatedUser.Id, false)
@@ -622,32 +665,49 @@ func UpdateUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if updatedUser.Role != common.RoleGuestUser && updatedUser.Role != originUser.Role {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	updatedUser.Role = originUser.Role
 	myRole := c.GetInt("role")
-	if myRole <= originUser.Role && myRole != common.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权更新同权限等级或更高权限等级的用户信息",
-		})
+	if !canManageTargetRole(myRole, originUser.Role) {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
 		return
-	}
-	if myRole <= updatedUser.Role && myRole != common.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权将其他用户权限等级提升到大于等于自己的权限等级",
-		})
-		return
-	}
-	if updatedUser.Password == "$I_LOVE_U" {
-		updatedUser.Password = "" // rollback to what it should be
 	}
 	updatePassword := updatedUser.Password != ""
-	if err := updatedUser.Edit(updatePassword); err != nil {
+	authzTouched := false
+	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if err := updatedUser.EditWithTx(tx, updatePassword); err != nil {
+			return err
+		}
+		touched, err := updateAdminPermissionsForUserInTx(c, tx, updatedUser.Id, originUser.Role, updatedUser.AdminPermissions)
+		authzTouched = touched
+		return err
+	}); err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	if originUser.Quota != updatedUser.Quota {
-		model.RecordLog(originUser.Id, model.LogTypeManage, fmt.Sprintf("管理员将用户额度从 %s修改为 %s", logger.LogQuota(originUser.Quota), logger.LogQuota(updatedUser.Quota)))
+	if authzTouched {
+		if err := authz.ReloadPolicy(); err != nil {
+			common.ApiError(c, err)
+			return
+		}
 	}
+	if updatedUser.AuthVersion > originUser.AuthVersion {
+		if _, err := model.RevokeAllUserSessions(updatedUser.Id, "admin_user_update"); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if err := model.PublishUserAuthCache(updatedUser.Id); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAuditFor(c, updatedUser.Id, "user.update", map[string]any{
+		"username": originUser.Username,
+		"id":       updatedUser.Id,
+	})
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -655,19 +715,67 @@ func UpdateUser(c *gin.Context) {
 	return
 }
 
-func UpdateSelf(c *gin.Context) {
-	var requestData map[string]interface{}
-	err := json.NewDecoder(c.Request.Body).Decode(&requestData)
+func AdminClearUserBinding(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 
-	// 检查是否是sidebar_modules更新请求
-	if sidebarModules, exists := requestData["sidebar_modules"]; exists {
+	bindingType := strings.ToLower(strings.TrimSpace(c.Param("binding_type")))
+	if bindingType == "" {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+
+	user, err := model.GetUserById(id, false)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
+	myRole := c.GetInt("role")
+	if !canManageTargetRole(myRole, user.Role) {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+		return
+	}
+
+	if err := user.ClearBinding(bindingType); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
+	recordManageAuditFor(c, user.Id, "user.binding_clear", map[string]any{
+		"bindingType": bindingType,
+		"username":    user.Username,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "success",
+	})
+}
+
+func UpdateSelf(c *gin.Context) {
+	var requestData map[string]any
+	if err := common.DecodeJson(c.Request.Body, &requestData); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+
+	passwordRequested := false
+	if value, exists := requestData["password"]; exists && value != nil {
+		password, isString := value.(string)
+		passwordRequested = !isString || password != ""
+	}
+	succeeded, notificationFailed := false, false
+	if passwordRequested {
+		defer func() {
+			recordUserSecurityAudit(c, c.GetInt("id"), "user.password_change", map[string]any{"success": succeeded, "notification_failed": notificationFailed})
+		}()
+	}
+	// 检查是否是用户设置更新请求 (sidebar_modules 或 language)
+	if sidebarModules, sidebarExists := requestData["sidebar_modules"]; sidebarExists && !passwordRequested {
 		userId := c.GetInt("id")
 		user, err := model.GetUserById(userId, false)
 		if err != nil {
@@ -683,50 +791,55 @@ func UpdateSelf(c *gin.Context) {
 			currentSetting.SidebarModules = sidebarModulesStr
 		}
 
-		// 保存更新后的设置
-		user.SetSetting(currentSetting)
-		if err := user.Update(false); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "更新设置失败: " + err.Error(),
-			})
+		if err := model.UpdateUserSetting(user.Id, currentSetting); err != nil {
+			common.ApiErrorI18n(c, i18n.MsgUpdateFailed)
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "设置更新成功",
-		})
+		common.ApiSuccessI18n(c, i18n.MsgUpdateSuccess, nil)
+		return
+	}
+
+	// 检查是否是语言偏好更新请求
+	if language, langExists := requestData["language"]; langExists && !passwordRequested {
+		userId := c.GetInt("id")
+		user, err := model.GetUserById(userId, false)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+
+		// 获取当前用户设置
+		currentSetting := user.GetSetting()
+
+		// 更新language字段
+		if langStr, ok := language.(string); ok {
+			currentSetting.Language = langStr
+		}
+
+		if err := model.UpdateUserSetting(user.Id, currentSetting); err != nil {
+			common.ApiErrorI18n(c, i18n.MsgUpdateFailed)
+			return
+		}
+
+		common.ApiSuccessI18n(c, i18n.MsgUpdateSuccess, nil)
 		return
 	}
 
 	// 原有的用户信息更新逻辑
 	var user model.User
-	requestDataBytes, err := json.Marshal(requestData)
+	requestDataBytes, err := common.Marshal(requestData)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	err = json.Unmarshal(requestDataBytes, &user)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+	if err = common.Unmarshal(requestDataBytes, &user); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 
-	if user.Password == "" {
-		user.Password = "$I_LOVE_U" // make Validator happy :)
-	}
-	if err := common.Validate.Struct(&user); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "输入不合法 " + err.Error(),
-		})
+	if err := common.Validate.StructExcept(&user, "Password"); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidInput)
 		return
 	}
 
@@ -736,44 +849,61 @@ func UpdateSelf(c *gin.Context) {
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
 	}
-	if user.Password == "$I_LOVE_U" {
-		user.Password = "" // rollback to what it should be
-		cleanUser.Password = ""
+	if user.Password != "" {
+		identity, ok := middleware.GetSessionAuthIdentity(c)
+		if !ok {
+			writeSecurityOperationError(c, service.ErrAuthTokenInvalid)
+			return
+		}
+		current, err := model.GetUserById(identity.UserID, true)
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		firstPassword := current.Password == ""
+		scope := service.VerificationScopePasswordChange
+		if firstPassword {
+			scope = service.VerificationScopePasswordSet
+		}
+		if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: scope}) == nil {
+			return
+		}
+		cleanUser.OriginalPassword = user.OriginalPassword
+		if err := model.ChangeUserPassword(identity, &cleanUser, firstPassword); err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		succeeded = true
+		notificationFailed = service.NotifyAccountSecurityChange(current.Email, "Password updated") != nil
+		if err := model.PublishUserAuthCache(cleanUser.Id); err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		bundle, err := service.AdvanceCurrentSessionToUserVersion(identity, "password_changed")
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "",
+			"data": gin.H{
+				"access_token":         bundle.AccessToken,
+				"token_type":           bundle.TokenType,
+				"access_expires_at":    bundle.AccessExpiresAt,
+				"session":              bundle.Session,
+				"has_password":         true,
+				"notification_warning": notificationFailed,
+			},
+		})
+		return
 	}
-	updatePassword, err := checkUpdatePassword(user.OriginalPassword, user.Password, cleanUser.Id)
-	if err != nil {
+	if err := cleanUser.Update(false); err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	if err := cleanUser.Update(updatePassword); err != nil {
-		common.ApiError(c, err)
-		return
-	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-	})
-	return
-}
-
-func checkUpdatePassword(originalPassword string, newPassword string, userId int) (updatePassword bool, err error) {
-	var currentUser *model.User
-	currentUser, err = model.GetUserById(userId, true)
-	if err != nil {
-		return
-	}
-
-	// 密码不为空,需要验证原密码
-	// 支持第一次账号绑定时原密码为空的情况
-	if !common.ValidatePasswordAndHash(originalPassword, currentUser.Password) && currentUser.Password != "" {
-		err = fmt.Errorf("原密码错误")
-		return
-	}
-	if newPassword == "" {
-		return
-	}
-	updatePassword = true
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 	return
 }
 
@@ -790,39 +920,18 @@ func DeleteUser(c *gin.Context) {
 	}
 	myRole := c.GetInt("role")
 	if myRole <= originUser.Role {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权删除同权限等级或更高权限等级的用户",
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
 		return
 	}
 	err = model.HardDeleteUserById(id)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "",
-		})
-		return
-	}
-}
-
-func DeleteSelf(c *gin.Context) {
-	id := c.GetInt("id")
-	user, _ := model.GetUserById(id, false)
-
-	if user.Role == common.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "不能删除超级管理员账户",
-		})
-		return
-	}
-
-	err := model.DeleteUserById(id)
-	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	recordManageAuditFor(c, originUser.Id, "user.delete", map[string]any{
+		"username": originUser.Username,
+		"id":       originUser.Id,
+	})
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -830,22 +939,43 @@ func DeleteSelf(c *gin.Context) {
 	return
 }
 
+func DeleteSelf(c *gin.Context) {
+	setAuthNoStore(c)
+	succeeded := false
+	defer func() {
+		recordUserSecurityAudit(c, c.GetInt("id"), "user.account_delete", map[string]any{"success": succeeded})
+	}()
+	if middleware.RequireSecurityProof(c, service.VerificationOperation{Scope: service.VerificationScopeAccountDelete}) == nil {
+		return
+	}
+	identity, _ := middleware.GetSessionAuthIdentity(c)
+	if err := model.DeleteUserForSession(identity); err != nil {
+		if errors.Is(err, model.ErrCannotDeleteRootUser) {
+			common.ApiErrorI18n(c, i18n.MsgUserCannotDeleteRootUser)
+			return
+		}
+		writeSecurityOperationError(c, err)
+		return
+	}
+	succeeded = true
+	service.ClearRefreshCookie(c)
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    gin.H{},
+	})
+}
+
 func CreateUser(c *gin.Context) {
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	user.Username = strings.TrimSpace(user.Username)
 	if err != nil || user.Username == "" || user.Password == "" {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 	if err := common.Validate.Struct(&user); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "输入不合法 " + err.Error(),
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
 	}
 	if user.DisplayName == "" {
@@ -853,10 +983,7 @@ func CreateUser(c *gin.Context) {
 	}
 	myRole := c.GetInt("role")
 	if user.Role >= myRole {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无法创建权限大于等于自己的用户",
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
 		return
 	}
 	// Even for admin users, we cannot fully trust them!
@@ -866,11 +993,30 @@ func CreateUser(c *gin.Context) {
 		DisplayName: user.DisplayName,
 		Role:        user.Role, // 保持管理员设置的角色
 	}
-	if err := cleanUser.Insert(0); err != nil {
+	authzTouched := false
+	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if err := cleanUser.InsertWithTx(tx, 0); err != nil {
+			return err
+		}
+		touched, err := updateAdminPermissionsForUserInTx(c, tx, cleanUser.Id, cleanUser.Role, user.AdminPermissions)
+		authzTouched = touched
+		return err
+	}); err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	if authzTouched {
+		if err := authz.ReloadPolicy(); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	cleanUser.FinishInsert(0)
 
+	recordManageAuditFor(c, cleanUser.Id, "user.create", map[string]any{
+		"username": cleanUser.Username,
+		"role":     cleanUser.Role,
+	})
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -878,21 +1024,40 @@ func CreateUser(c *gin.Context) {
 	return
 }
 
+func updateAdminPermissionsForUserInTx(c *gin.Context, tx *gorm.DB, userID int, userRole int, permissions map[string]map[string]bool) (bool, error) {
+	if permissions == nil {
+		if userRole < common.RoleAdminUser && c.GetInt("role") == common.RoleRootUser {
+			return true, authz.ClearUserAuthorizationInTx(tx, userID)
+		}
+		return false, nil
+	}
+	if c.GetInt("role") != common.RoleRootUser {
+		return false, fmt.Errorf("only root can update admin permissions")
+	}
+	if userRole < common.RoleAdminUser {
+		return true, authz.ClearUserAuthorizationInTx(tx, userID)
+	}
+	return true, authz.SetUserPermissionsInTx(tx, userID, permissions)
+}
+
 type ManageRequest struct {
 	Id     int    `json:"id"`
 	Action string `json:"action"`
+	Value  int    `json:"value"`
+	Mode   string `json:"mode"`
 }
 
 // ManageUser Only admin user can do this
 func ManageUser(c *gin.Context) {
 	var req ManageRequest
-	err := json.NewDecoder(c.Request.Body).Decode(&req)
+	err := common.DecodeJson(c.Request.Body, &req)
 
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	if req.Action == "add_quota" {
+		manageUserQuota(c, req)
 		return
 	}
 	user := model.User{
@@ -901,38 +1066,26 @@ func ManageUser(c *gin.Context) {
 	// Fill attributes
 	model.DB.Unscoped().Where(&user).First(&user)
 	if user.Id == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "用户不存在",
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
 		return
 	}
 	myRole := c.GetInt("role")
-	if myRole <= user.Role && myRole != common.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权更新同权限等级或更高权限等级的用户信息",
-		})
+	if !canManageTargetRole(myRole, user.Role) {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
 		return
 	}
 	switch req.Action {
 	case "disable":
 		user.Status = common.UserStatusDisabled
 		if user.Role == common.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法禁用超级管理员用户",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserCannotDisableRootUser)
 			return
 		}
 	case "enable":
 		user.Status = common.UserStatusEnabled
 	case "delete":
 		if user.Role == common.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法删除超级管理员用户",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserCannotDeleteRootUser)
 			return
 		}
 		if err := user.Delete(); err != nil {
@@ -942,44 +1095,86 @@ func ManageUser(c *gin.Context) {
 			})
 			return
 		}
+		// 删除用户后，强制清理 Redis 中所有该用户令牌的缓存，
+		// 避免已缓存的令牌在 TTL 过期前仍能通过 TokenAuth 校验。
+		if err := model.InvalidateUserTokensCache(user.Id); err != nil {
+			common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))
+		}
+		recordManageAuditFor(c, user.Id, "user.manage", map[string]any{
+			"action":   req.Action,
+			"username": user.Username,
+			"id":       user.Id,
+		})
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "",
+		})
+		return
 	case "promote":
 		if myRole != common.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "普通管理员用户无法提升其他用户为管理员",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserAdminCannotPromote)
 			return
 		}
 		if user.Role >= common.RoleAdminUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "该用户已经是管理员",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserAlreadyAdmin)
 			return
 		}
 		user.Role = common.RoleAdminUser
 	case "demote":
 		if user.Role == common.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法降级超级管理员用户",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserCannotDemoteRootUser)
 			return
 		}
 		if user.Role == common.RoleCommonUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "该用户已经是普通用户",
-			})
+			common.ApiErrorI18n(c, i18n.MsgUserAlreadyCommon)
 			return
 		}
 		user.Role = common.RoleCommonUser
-	}
-
-	if err := user.Update(false); err != nil {
-		common.ApiError(c, err)
+	default:
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+
+	if req.Action == "demote" {
+		if err := model.DB.Transaction(func(tx *gorm.DB) error {
+			if err := user.UpdateWithTx(tx, false); err != nil {
+				return err
+			}
+			return authz.ClearUserAuthorizationInTx(tx, user.Id)
+		}); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if err := authz.ReloadPolicy(); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if err := model.PublishUserAuthCache(user.Id); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if _, err := model.RevokeAllUserSessions(user.Id, "admin_demote"); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	} else {
+		if err := user.Update(false); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	// Update/UpdateWithTx has already published the new user hash and revoked
+	// browser sessions exactly once. Only PAT/relay token caches still need an
+	// explicit invalidation; deleting the user hash here would discard the
+	// freshly published auth-version floor.
+	if err := model.InvalidateUserTokensCache(user.Id); err != nil {
+		common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))
+	}
+	recordManageAuditFor(c, user.Id, "user.manage", map[string]any{
+		"action":   req.Action,
+		"username": user.Username,
+		"id":       user.Id,
+	})
 	clearUser := model.User{
 		Role:   user.Role,
 		Status: user.Status,
@@ -988,40 +1183,6 @@ func ManageUser(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data":    clearUser,
-	})
-	return
-}
-
-func EmailBind(c *gin.Context) {
-	email := c.Query("email")
-	code := c.Query("code")
-	if !common.VerifyCodeWithKey(email, code, common.EmailVerificationPurpose) {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "验证码错误或已过期",
-		})
-		return
-	}
-	session := sessions.Default(c)
-	id := session.Get("id")
-	user := model.User{
-		Id: id.(int),
-	}
-	err := user.FillUserById()
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	user.Email = email
-	// no need to check if this email already taken, because we have used verification code to check it
-	err = user.Update(false)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
 	})
 	return
 }
@@ -1072,13 +1233,15 @@ func getTopUpLock(userID int) *topUpTryLock {
 }
 
 func TopUp(c *gin.Context) {
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		common.ApiErrorI18n(c, i18n.MsgPaymentComplianceRequired)
+		return
+	}
+
 	id := c.GetInt("id")
 	lock := getTopUpLock(id)
 	if !lock.TryLock() {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "充值处理中，请稍后重试",
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserTopUpProcessing)
 		return
 	}
 	defer lock.Unlock()
@@ -1090,7 +1253,9 @@ func TopUp(c *gin.Context) {
 	}
 	quota, err := model.Redeem(req.Key, id)
 	if err != nil {
-		common.ApiError(c, err)
+		// 不向用户暴露兑换失败的细分原因，避免攻击者根据错误类型判断兑换码状态。
+		common.ApiErrorI18n(c, i18n.MsgRedeemFailed)
+		logger.LogError(c, fmt.Sprintf("failed to redeem key %s for user %d: %s", req.Key, id, err.Error()))
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -1101,62 +1266,48 @@ func TopUp(c *gin.Context) {
 }
 
 type UpdateUserSettingRequest struct {
-	QuotaWarningType           string  `json:"notify_type"`
-	QuotaWarningThreshold      float64 `json:"quota_warning_threshold"`
-	WebhookUrl                 string  `json:"webhook_url,omitempty"`
-	WebhookSecret              string  `json:"webhook_secret,omitempty"`
-	NotificationEmail          string  `json:"notification_email,omitempty"`
-	BarkUrl                    string  `json:"bark_url,omitempty"`
-	GotifyUrl                  string  `json:"gotify_url,omitempty"`
-	GotifyToken                string  `json:"gotify_token,omitempty"`
-	GotifyPriority             int     `json:"gotify_priority,omitempty"`
-	AcceptUnsetModelRatioModel bool    `json:"accept_unset_model_ratio_model"`
-	RecordIpLog                bool    `json:"record_ip_log"`
+	QuotaWarningType                 string  `json:"notify_type"`
+	QuotaWarningThreshold            float64 `json:"quota_warning_threshold"`
+	WebhookUrl                       string  `json:"webhook_url,omitempty"`
+	WebhookSecret                    string  `json:"webhook_secret,omitempty"`
+	NotificationEmail                string  `json:"notification_email,omitempty"`
+	BarkUrl                          string  `json:"bark_url,omitempty"`
+	GotifyUrl                        string  `json:"gotify_url,omitempty"`
+	GotifyToken                      string  `json:"gotify_token,omitempty"`
+	GotifyPriority                   int     `json:"gotify_priority,omitempty"`
+	UpstreamModelUpdateNotifyEnabled *bool   `json:"upstream_model_update_notify_enabled,omitempty"`
+	AcceptUnsetModelRatioModel       bool    `json:"accept_unset_model_ratio_model"`
+	RecordIpLog                      bool    `json:"record_ip_log"`
 }
 
 func UpdateUserSetting(c *gin.Context) {
 	var req UpdateUserSettingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 
 	// 验证预警类型
 	if req.QuotaWarningType != dto.NotifyTypeEmail && req.QuotaWarningType != dto.NotifyTypeWebhook && req.QuotaWarningType != dto.NotifyTypeBark && req.QuotaWarningType != dto.NotifyTypeGotify {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的预警类型",
-		})
+		common.ApiErrorI18n(c, i18n.MsgSettingInvalidType)
 		return
 	}
 
 	// 验证预警阈值
 	if req.QuotaWarningThreshold <= 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "预警阈值必须大于0",
-		})
+		common.ApiErrorI18n(c, i18n.MsgQuotaThresholdGtZero)
 		return
 	}
 
 	// 如果是webhook类型,验证webhook地址
 	if req.QuotaWarningType == dto.NotifyTypeWebhook {
 		if req.WebhookUrl == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "Webhook地址不能为空",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingWebhookEmpty)
 			return
 		}
 		// 验证URL格式
 		if _, err := url.ParseRequestURI(req.WebhookUrl); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无效的Webhook地址",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingWebhookInvalid)
 			return
 		}
 	}
@@ -1165,10 +1316,7 @@ func UpdateUserSetting(c *gin.Context) {
 	if req.QuotaWarningType == dto.NotifyTypeEmail && req.NotificationEmail != "" {
 		// 验证邮箱格式
 		if !strings.Contains(req.NotificationEmail, "@") {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无效的邮箱地址",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingEmailInvalid)
 			return
 		}
 	}
@@ -1176,26 +1324,17 @@ func UpdateUserSetting(c *gin.Context) {
 	// 如果是Bark类型，验证Bark URL
 	if req.QuotaWarningType == dto.NotifyTypeBark {
 		if req.BarkUrl == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "Bark推送URL不能为空",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingBarkUrlEmpty)
 			return
 		}
 		// 验证URL格式
 		if _, err := url.ParseRequestURI(req.BarkUrl); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无效的Bark推送URL",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingBarkUrlInvalid)
 			return
 		}
 		// 检查是否是HTTP或HTTPS
 		if !strings.HasPrefix(req.BarkUrl, "https://") && !strings.HasPrefix(req.BarkUrl, "http://") {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "Bark推送URL必须以http://或https://开头",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingUrlMustHttp)
 			return
 		}
 	}
@@ -1203,33 +1342,21 @@ func UpdateUserSetting(c *gin.Context) {
 	// 如果是Gotify类型，验证Gotify URL和Token
 	if req.QuotaWarningType == dto.NotifyTypeGotify {
 		if req.GotifyUrl == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "Gotify服务器地址不能为空",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingGotifyUrlEmpty)
 			return
 		}
 		if req.GotifyToken == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "Gotify令牌不能为空",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingGotifyTokenEmpty)
 			return
 		}
 		// 验证URL格式
 		if _, err := url.ParseRequestURI(req.GotifyUrl); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无效的Gotify服务器地址",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingGotifyUrlInvalid)
 			return
 		}
 		// 检查是否是HTTP或HTTPS
 		if !strings.HasPrefix(req.GotifyUrl, "https://") && !strings.HasPrefix(req.GotifyUrl, "http://") {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "Gotify服务器地址必须以http://或https://开头",
-			})
+			common.ApiErrorI18n(c, i18n.MsgSettingUrlMustHttp)
 			return
 		}
 	}
@@ -1240,13 +1367,19 @@ func UpdateUserSetting(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	existingSettings := user.GetSetting()
+	upstreamModelUpdateNotifyEnabled := existingSettings.UpstreamModelUpdateNotifyEnabled
+	if user.Role >= common.RoleAdminUser && req.UpstreamModelUpdateNotifyEnabled != nil {
+		upstreamModelUpdateNotifyEnabled = *req.UpstreamModelUpdateNotifyEnabled
+	}
 
 	// 构建设置
 	settings := dto.UserSetting{
-		NotifyType:            req.QuotaWarningType,
-		QuotaWarningThreshold: req.QuotaWarningThreshold,
-		AcceptUnsetRatioModel: req.AcceptUnsetModelRatioModel,
-		RecordIpLog:           req.RecordIpLog,
+		NotifyType:                       req.QuotaWarningType,
+		QuotaWarningThreshold:            req.QuotaWarningThreshold,
+		UpstreamModelUpdateNotifyEnabled: upstreamModelUpdateNotifyEnabled,
+		AcceptUnsetRatioModel:            req.AcceptUnsetModelRatioModel,
+		RecordIpLog:                      req.RecordIpLog,
 	}
 
 	// 如果是webhook类型,添加webhook相关设置
@@ -1280,17 +1413,10 @@ func UpdateUserSetting(c *gin.Context) {
 	}
 
 	// 更新用户设置
-	user.SetSetting(settings)
-	if err := user.Update(false); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "更新设置失败: " + err.Error(),
-		})
+	if err := model.UpdateUserSetting(user.Id, settings); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgUpdateFailed)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "设置已更新",
-	})
+	common.ApiSuccessI18n(c, i18n.MsgSettingSaved, nil)
 }

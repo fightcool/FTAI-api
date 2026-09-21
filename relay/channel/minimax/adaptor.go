@@ -8,15 +8,16 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/types"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/samber/lo"
 )
 
 type Adaptor struct {
@@ -27,7 +28,8 @@ func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dt
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, req *dto.ClaudeRequest) (any, error) {
-	return nil, errors.New("not implemented")
+	adaptor := claude.Adaptor{}
+	return adaptor.ConvertClaudeRequest(c, info, req)
 }
 
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
@@ -36,7 +38,7 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 	}
 
 	voiceID := request.Voice
-	speed := request.Speed
+	speed := lo.FromPtrOr(request.Speed, 0.0)
 	outputFormat := request.ResponseFormat
 
 	minimaxRequest := MiniMaxTTSRequest{
@@ -76,7 +78,10 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 }
 
 func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
-	return request, nil
+	if info.RelayMode != constant.RelayModeImagesGenerations {
+		return nil, fmt.Errorf("unsupported image relay mode: %d", info.RelayMode)
+	}
+	return oaiImage2MiniMaxImageRequest(request), nil
 }
 
 func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
@@ -95,19 +100,6 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
 	if request == nil {
 		return nil, errors.New("request is nil")
-	}
-	// voice_design / get_voice: 透传原始请求体到 MiniMax（移除 model 字段）
-	if info.RelayMode == constant.RelayModeVoiceDesign || info.RelayMode == constant.RelayModeGetVoice {
-		body, err := common.GetRequestBody(c)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get request body: %w", err)
-		}
-		var bodyMap map[string]any
-		if err := json.Unmarshal(body, &bodyMap); err != nil {
-			return nil, fmt.Errorf("failed to parse request body: %w", err)
-		}
-		delete(bodyMap, "model")
-		return bodyMap, nil
 	}
 	return request, nil
 }
@@ -132,18 +124,18 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if info.RelayMode == constant.RelayModeAudioSpeech {
 		return handleTTSResponse(c, resp, info)
 	}
-
-	// voice_design / get_voice: 直接透传 MiniMax 响应，不消耗配额
-	if info.RelayMode == constant.RelayModeVoiceDesign || info.RelayMode == constant.RelayModeGetVoice {
-		_, apiErr := handleChatCompletionResponse(c, resp, info)
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		return &dto.Usage{}, nil
+	if info.RelayMode == constant.RelayModeImagesGenerations {
+		return miniMaxImageHandler(c, resp, info)
 	}
 
-	adaptor := openai.Adaptor{}
-	return adaptor.DoResponse(c, resp, info)
+	switch info.RelayFormat {
+	case types.RelayFormatClaude:
+		adaptor := claude.Adaptor{}
+		return adaptor.DoResponse(c, resp, info)
+	default:
+		adaptor := openai.Adaptor{}
+		return adaptor.DoResponse(c, resp, info)
+	}
 }
 
 func (a *Adaptor) GetModelList() []string {
